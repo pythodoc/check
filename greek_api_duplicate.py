@@ -80,6 +80,43 @@ class GreekAPI:
 
         self._handle_login_error(error_code)
 
+    @staticmethod
+    def _normalize_allresp_payload(data):
+        payload = dict(data or {})
+        payload.pop('level2', None)
+        schema_defaults = {
+            'symbol': '',
+            'name': '',
+            'exch': '',
+            'asset_type': '',
+            'ltp': '0',
+            'open': '0',
+            'high': '0',
+            'low': '0',
+            'close': '0',
+            'change': '0',
+            'p_change': '0',
+            'tot_vol': '0',
+            'tot_buyQty': '0',
+            'tot_sellQty': '0',
+            'ltq': '0',
+            'bid': '0',
+            'ask': '0',
+            'bidqty': '0',
+            'askqty': '0',
+            'oi': '0',
+            'ltt': '',
+            'lut': '',
+            'atp': '0',
+            'taq': '0',
+            'tbq': '0',
+            'h52w': '0',
+            'l52w': '0',
+        }
+        for key, default in schema_defaults.items():
+            payload.setdefault(key, default)
+        return payload
+
     def _handle_login_error(self, error_code):
         """Centralized error handling for login"""
         error_messages = {
@@ -298,10 +335,12 @@ class GreekAPI:
         if tkn_raw is None:
             return
         tkn = str(tkn_raw)
-        counter = self.token_counter.get(tkn, 3)
-        if counter < 3:
-            self.token_counter[tkn] = counter + 1
-            return
+        # For allresp mode, push every tick immediately.
+        if self.req_data != 'allresp':
+            counter = self.token_counter.get(tkn, 3)
+            if counter < 3:
+                self.token_counter[tkn] = counter + 1
+                return
 
         sym = data.get('name')
         ltp = data.get('ltp')
@@ -314,7 +353,7 @@ class GreekAPI:
         elif self.req_data == 'ask/bid':
             packed_data = (tkn, sym, data.get('bid'), data.get('ask'), ltt, lut, oi)
         elif self.req_data == 'allresp':
-            packed_data = data
+            packed_data = self._normalize_allresp_payload(data)
         else:
             packed_data = (tkn, sym, ltp, ltt, lut, data.get('tot_vol'), oi)
 

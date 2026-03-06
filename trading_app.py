@@ -3,17 +3,21 @@ import queue
 import threading as mt
 import traceback
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from greek_api_duplicate import GreekAPI
+import pandas as pd
 
 try:
     from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPointF, Qt, QTimer, Signal, QObject
-    from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
+    from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QPolygonF, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QButtonGroup,
         QCheckBox,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
@@ -30,6 +34,18 @@ try:
         QVBoxLayout,
         QWidget,
     )
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        HAS_WEBENGINE = True
+    except ImportError:
+        QWebEngineView = None
+        HAS_WEBENGINE = False
+    try:
+        from lightweight_charts.widgets import QtChart as LWQtChart
+        HAS_LW_PY = True
+    except Exception:
+        LWQtChart = None
+        HAS_LW_PY = False
 except ImportError as exc:
     raise ImportError("PySide6 is required. Install with: pip install PySide6") from exc
 
@@ -50,20 +66,116 @@ def _format_number(value, decimals=2):
     return f"{num:,.{decimals}f}"
 
 
+def _format_ws_time(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=IST).strftime("%d-%m-%Y %H:%M:%S")
+        except Exception:
+            return str(value)
+    text = str(value).strip()
+    if text.isdigit():
+        ts = float(text)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=IST).strftime("%d-%m-%Y %H:%M:%S")
+        except Exception:
+            return text
+    return text
+
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _to_epoch_seconds_ist(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        return int(ts)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        ts = float(text)
+        if ts > 10_000_000_000:
+            ts = ts / 1000.0
+        return int(ts)
+
+    for fmt in ("%d-%m-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=IST)
+            return int(dt.timestamp())
+        except Exception:
+            pass
+
+    iso = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        else:
+            dt = dt.astimezone(IST)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
 class SignalBus(QObject):
     log = Signal(str)
     error = Signal(str, str)
     status = Signal(str)
+    login_state = Signal(bool)
+    session_info = Signal(str)
+    ohlc_series = Signal(str, list, list, list)
+    account_table = Signal(str, list, list)
+    refresh_orderbook = Signal()
     account_text = Signal(str)
     clear_watch = Signal()
     remove_tokens = Signal(list)
 
 
 class MarketTableModel(QAbstractTableModel):
-    columns = ("token", "name", "ltp", "change", "ltt", "lut", "volume", "oi")
+    default_columns = [
+        "symbol",
+        "name",
+        "ltp",
+        "change",
+        "ltt",
+        "lut",
+        "tot_vol",
+        "oi",
+        "open",
+        "high",
+        "low",
+        "close",
+        "p_change",
+        "bid",
+        "ask",
+        "bidqty",
+        "askqty",
+        "tot_buyQty",
+        "tot_sellQty",
+        "ltq",
+        "exch",
+        "asset_type",
+        "atp",
+        "taq",
+        "tbq",
+        "h52w",
+        "l52w",
+    ]
 
     def __init__(self):
         super().__init__()
+        self._columns = list(self.default_columns)
         self._rows = []
         self._index = {}
 
@@ -75,7 +187,7 @@ class MarketTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         if parent.isValid():
             return 0
-        return len(self.columns)
+        return len(self._columns)
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
@@ -83,27 +195,28 @@ class MarketTableModel(QAbstractTableModel):
 
         row = self._rows[index.row()]
         col = index.column()
-        value = row[col]
+        key = self._columns[col]
+        value = row.get(key)
 
         if role == Qt.DisplayRole:
-            if col == 2:
+            if key in ("ltp", "open", "high", "low", "close", "bid", "ask", "atp", "h52w", "l52w"):
                 return _format_number(value, 2)
-            if col == 3:
+            if key in ("change", "p_change"):
                 change = _to_float(value)
                 if change is None:
                     return "-"
                 return f"{change:+,.2f}"
-            if col in (6, 7):
+            if key in ("tot_vol", "oi", "bidqty", "askqty", "tot_buyQty", "tot_sellQty", "ltq", "taq", "tbq"):
                 return _format_number(value, 0)
             return "-" if value in (None, "") else str(value)
 
         if role == Qt.TextAlignmentRole:
-            if col == 1:
+            if key in ("name", "ltt", "lut", "exch", "asset_type"):
                 return Qt.AlignLeft | Qt.AlignVCenter
             return Qt.AlignCenter
 
-        if role == Qt.ForegroundRole and col in (2, 3):
-            change = _to_float(row[3])
+        if role == Qt.ForegroundRole and key in ("ltp", "change", "p_change"):
+            change = _to_float(row.get("change"))
             if change is None:
                 return QColor("#8b949e")
             if change > 0:
@@ -118,7 +231,7 @@ class MarketTableModel(QAbstractTableModel):
         if role != Qt.DisplayRole:
             return None
         if orientation == Qt.Horizontal:
-            return self.columns[section].upper()
+            return self._columns[section].upper()
         return str(section + 1)
 
     def clear(self):
@@ -132,15 +245,31 @@ class MarketTableModel(QAbstractTableModel):
         if not token_set:
             return
 
-        filtered = [row for row in self._rows if str(row[0]) not in token_set]
+        filtered = [row for row in self._rows if str(row.get("symbol")) not in token_set]
         self.beginResetModel()
         self._rows = filtered
-        self._index = {str(row[0]): i for i, row in enumerate(self._rows)}
+        self._index = {str(row.get("symbol")): i for i, row in enumerate(self._rows)}
+        self.endResetModel()
+
+    def _ensure_columns(self, keys):
+        existing = set(self._columns)
+        new_cols = [k for k in keys if k not in existing]
+        if not new_cols:
+            return
+        self.beginResetModel()
+        self._columns.extend(new_cols)
         self.endResetModel()
 
     def upsert_many(self, normalized_ticks):
         if not normalized_ticks:
             return
+
+        dynamic_keys = set()
+        for tick in normalized_ticks.values():
+            if isinstance(tick, dict):
+                dynamic_keys.update(tick.keys())
+        dynamic_keys.discard("level2")
+        self._ensure_columns(dynamic_keys)
 
         changed_rows = []
         inserted_rows = []
@@ -148,28 +277,35 @@ class MarketTableModel(QAbstractTableModel):
         for token, tick in normalized_ticks.items():
             idx = self._index.get(token)
             if idx is None:
-                ltp = _to_float(tick[2])
-                new_row = [tick[0], tick[1], ltp if ltp is not None else tick[2], 0.0, tick[3], tick[4], tick[5], tick[6]]
+                new_row = dict(tick)
+                new_row["symbol"] = str(token)
+                ltp = _to_float(new_row.get("ltp"))
+                if ltp is not None:
+                    new_row["ltp"] = ltp
+                if "oi" not in new_row and "currentOI" in new_row:
+                    new_row["oi"] = new_row.get("currentOI")
+                new_row["change"] = _to_float(new_row.get("change")) or 0.0
                 inserted_rows.append(new_row)
             else:
                 row = self._rows[idx]
-                prev_ltp = _to_float(row[2])
-                new_ltp = _to_float(tick[2])
+                prev_ltp = _to_float(row.get("ltp"))
+                new_ltp = _to_float(tick.get("ltp"))
                 if new_ltp is None:
                     new_ltp = prev_ltp
                 if prev_ltp is None or new_ltp is None:
-                    change = row[3]
+                    change = _to_float(row.get("change")) or 0.0
                 else:
                     change = new_ltp - prev_ltp
 
-                row[0] = tick[0]
-                row[1] = tick[1] if tick[1] not in (None, "") else row[1]
-                row[2] = new_ltp if new_ltp is not None else tick[2]
-                row[3] = change
-                row[4] = tick[3]
-                row[5] = tick[4]
-                row[6] = tick[5]
-                row[7] = tick[6]
+                row.update(tick)
+                row["symbol"] = str(token)
+                if row.get("name") in (None, ""):
+                    row["name"] = tick.get("name", "")
+                if new_ltp is not None:
+                    row["ltp"] = new_ltp
+                if "oi" not in row and "currentOI" in row:
+                    row["oi"] = row.get("currentOI")
+                row["change"] = change
                 changed_rows.append(idx)
 
         if inserted_rows:
@@ -179,17 +315,17 @@ class MarketTableModel(QAbstractTableModel):
             self._rows.extend(inserted_rows)
             self.endInsertRows()
             for i in range(start, end + 1):
-                self._index[str(self._rows[i][0])] = i
+                self._index[str(self._rows[i].get("symbol"))] = i
 
         for row_idx in changed_rows:
             left = self.index(row_idx, 0)
-            right = self.index(row_idx, len(self.columns) - 1)
+            right = self.index(row_idx, len(self._columns) - 1)
             self.dataChanged.emit(left, right, [Qt.DisplayRole, Qt.ForegroundRole])
 
     def token_at_row(self, row_idx):
         if row_idx < 0 or row_idx >= len(self._rows):
             return None
-        return str(self._rows[row_idx][0])
+        return str(self._rows[row_idx].get("symbol"))
 
     def find_row_by_token(self, token):
         return self._index.get(str(token))
@@ -201,19 +337,72 @@ class MarketTableModel(QAbstractTableModel):
         return self._rows[idx]
 
 
+class AccountTableModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self._columns = []
+        self._rows = []
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            value = self._rows[index.row()].get(self._columns[index.column()])
+            return "-" if value in (None, "") else str(value)
+        if role == Qt.TextAlignmentRole:
+            return Qt.AlignCenter
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            if section < len(self._columns):
+                return str(self._columns[section]).upper()
+            return ""
+        return str(section + 1)
+
+    def clear(self):
+        self.beginResetModel()
+        self._columns = []
+        self._rows = []
+        self.endResetModel()
+
+    def set_records(self, columns, rows):
+        self.beginResetModel()
+        self._columns = list(columns)
+        self._rows = list(rows)
+        self.endResetModel()
+
+
 class PriceChartWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setMinimumHeight(420)
         self._active_token = None
-        self._history = deque(maxlen=320)
+        self._history = deque(maxlen=320)  # close prices for line mode
+        self._candles = deque(maxlen=320)  # tuples: (open, high, low, close)
+        self._times = deque(maxlen=320)    # display timestamps aligned with points
         self._timeframe = "5m"
+        self._chart_type = "line"
 
     def set_active_token(self, token):
         token = str(token) if token else None
         if token != self._active_token:
             self._active_token = token
             self._history.clear()
+            self._candles.clear()
+            self._times.clear()
             self.update()
 
     def set_timeframe(self, tf):
@@ -221,15 +410,56 @@ class PriceChartWidget(QWidget):
         size_map = {"1m": 180, "5m": 320, "15m": 480, "1h": 650}
         max_points = size_map.get(tf, 320)
         self._history = deque(list(self._history)[-max_points:], maxlen=max_points)
+        self._candles = deque(list(self._candles)[-max_points:], maxlen=max_points)
+        self._times = deque(list(self._times)[-max_points:], maxlen=max_points)
         self.update()
 
-    def push_price(self, token, ltp):
+    def set_chart_type(self, chart_type):
+        self._chart_type = "candlestick" if chart_type == "candlestick" else "line"
+        self.update()
+
+    def push_price(self, token, ltp, ts=None):
         if str(token) != str(self._active_token):
             return
         price = _to_float(ltp)
         if price is None:
             return
         self._history.append(price)
+        self._candles.append((price, price, price, price))
+        self._times.append(str(ts or ""))
+        self.update()
+
+    def set_history(self, token, prices, candles=None, times=None):
+        if str(token) != str(self._active_token):
+            return
+        normalized = []
+        for value in prices:
+            num = _to_float(value)
+            if num is not None:
+                normalized.append(num)
+        self._history.clear()
+        if normalized:
+            self._history.extend(normalized[-self._history.maxlen :])
+
+        self._candles.clear()
+        if candles:
+            valid = []
+            for item in candles:
+                if not isinstance(item, (list, tuple)) or len(item) < 4:
+                    continue
+                opn = _to_float(item[0])
+                high = _to_float(item[1])
+                low = _to_float(item[2])
+                close = _to_float(item[3])
+                if None in (opn, high, low, close):
+                    continue
+                valid.append((opn, high, low, close))
+            self._candles.extend(valid[-self._candles.maxlen :])
+
+        self._times.clear()
+        if isinstance(times, list) and times:
+            cleaned = [str(t) if t is not None else "" for t in times]
+            self._times.extend(cleaned[-self._times.maxlen :])
         self.update()
 
     def paintEvent(self, event):
@@ -263,14 +493,29 @@ class PriceChartWidget(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "Select a token from Watchlist to view chart")
             return
 
-        if len(self._history) < 2:
+        prices = list(self._history)
+        candles = list(self._candles)
+        times = list(self._times)
+        has_line = len(prices) >= 2
+        has_candle = len(candles) >= 2
+        use_candle = self._chart_type == "candlestick"
+
+        if (use_candle and not has_candle) and not has_line:
             painter.setPen(QColor("#8b949e"))
             painter.drawText(self.rect(), Qt.AlignCenter, f"{self._active_token} waiting for live ticks...")
             return
 
-        prices = list(self._history)
-        min_price = min(prices)
-        max_price = max(prices)
+        if (not use_candle) and not has_line:
+            painter.setPen(QColor("#8b949e"))
+            painter.drawText(self.rect(), Qt.AlignCenter, f"{self._active_token} waiting for live ticks...")
+            return
+
+        if use_candle and has_candle:
+            min_price = min(c[2] for c in candles)
+            max_price = max(c[1] for c in candles)
+        else:
+            min_price = min(prices)
+            max_price = max(prices)
         if max_price <= min_price:
             max_price += 1.0
             min_price -= 1.0
@@ -280,17 +525,38 @@ class PriceChartWidget(QWidget):
         min_price -= pad
         span = max_price - min_price
 
-        poly = QPolygonF()
-        for i, price in enumerate(prices):
-            x = left + (i / (len(prices) - 1)) * w
-            y = top + ((max_price - price) / span) * h
-            poly.append(QPointF(x, y))
+        if use_candle and has_candle:
+            count = len(candles)
+            step = w / max(1, count)
+            body_width = max(3.0, min(16.0, step * 0.7))
+            for i, (opn, high, low, close) in enumerate(candles):
+                x_center = left + (i + 0.5) * step
+                y_high = top + ((max_price - high) / span) * h
+                y_low = top + ((max_price - low) / span) * h
+                y_open = top + ((max_price - opn) / span) * h
+                y_close = top + ((max_price - close) / span) * h
 
-        line_pen = QPen(QColor("#22d3ee"), 2)
-        painter.setPen(line_pen)
-        painter.drawPolyline(poly)
+                up = close >= opn
+                body_color = QColor("#22c55e" if up else "#ef4444")
+                wick_pen = QPen(body_color, 1)
+                painter.setPen(wick_pen)
+                painter.drawLine(int(x_center), int(y_high), int(x_center), int(y_low))
 
-        last = prices[-1]
+                body_top = min(y_open, y_close)
+                body_height = max(1.0, abs(y_close - y_open))
+                painter.fillRect(int(x_center - body_width / 2), int(body_top), int(body_width), int(body_height), body_color)
+            last = candles[-1][3]
+        else:
+            poly = QPolygonF()
+            for i, price in enumerate(prices):
+                x = left + (i / (len(prices) - 1)) * w
+                y = top + ((max_price - price) / span) * h
+                poly.append(QPointF(x, y))
+            line_pen = QPen(QColor("#22d3ee"), 2)
+            painter.setPen(line_pen)
+            painter.drawPolyline(poly)
+            last = prices[-1]
+
         last_y = top + ((max_price - last) / span) * h
         painter.setPen(QPen(QColor("#f59e0b"), 1, Qt.DashLine))
         painter.drawLine(left, int(last_y), right, int(last_y))
@@ -303,8 +569,438 @@ class PriceChartWidget(QWidget):
         painter.drawText(left, 16, f"{self._active_token}  |  {self._timeframe}")
         painter.drawText(right - 180, 16, f"Last: {_format_number(last, 2)}")
 
+        # Render simple time axis labels when timestamps are available.
+        if times:
+            t_first = times[0] if len(times) > 0 else ""
+            t_mid = times[len(times) // 2] if len(times) > 2 else ""
+            t_last = times[-1] if len(times) > 1 else ""
+            painter.setPen(QColor("#93a4b8"))
+            if t_first:
+                painter.drawText(left, bottom + 18, t_first)
+            if t_mid:
+                painter.drawText(int((left + right) / 2) - 70, bottom + 18, t_mid)
+            if t_last:
+                painter.drawText(right - 140, bottom + 18, t_last)
+
         painter.setPen(QColor("#334155"))
-        painter.drawText(right - 84, bottom + 18, "GREEKVIEW")
+        painter.drawText(right - 84, bottom + 34, "GREEKVIEW")
+
+
+class LightweightChartWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._active_token = None
+        self._timeframe = "5m"
+        self._chart_type = "line"
+        self._loaded = False
+        self._last_history = None
+        self._fallback = None
+        self._view = None
+        self._qt_chart = None
+        self._qt_line = None
+        self._qt_has_data = False
+        self._qt_last_prices = []
+        self._qt_last_candles = []
+        self._qt_last_times = []
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+
+        if HAS_LW_PY:
+            try:
+                self._qt_chart = LWQtChart(self)
+                self._layout.addWidget(self._qt_chart.webview, 1)
+                self._qt_chart.time_scale(time_visible=True, seconds_visible=True)
+                self._qt_has_data = False
+                return
+            except Exception:
+                self._qt_chart = None
+
+        if not HAS_WEBENGINE:
+            self._fallback = PriceChartWidget()
+            self._layout.addWidget(self._fallback, 1)
+            return
+
+        self._view = QWebEngineView()
+        self._view.loadFinished.connect(self._on_loaded)
+        self._view.setHtml(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body, #chart { width: 100%; height: 100%; margin: 0; background: #0b1220; color: #cbd5e1; }
+    #msg { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: #94a3b8; }
+  </style>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="chart"></div>
+  <div id="msg">Lightweight Charts JS not loaded. Falling back...</div>
+  <script>
+    const root = document.getElementById('chart');
+    const msg = document.getElementById('msg');
+    if (typeof LightweightCharts === 'undefined') {
+      window.__lw_ready = false;
+      msg.style.display = 'flex';
+    } else {
+      window.__lw_ready = true;
+    }
+    if (window.__lw_ready) {
+    const chart = LightweightCharts.createChart(root, {
+      layout: { background: { color: '#0b1220' }, textColor: '#cbd5e1' },
+      grid: { vertLines: { color: '#1f2a3a' }, horzLines: { color: '#1f2a3a' } },
+      rightPriceScale: { borderColor: '#334155' },
+      timeScale: {
+        borderColor: '#334155',
+        timeVisible: true,
+        secondsVisible: true
+      },
+      localization: {
+        timeFormatter: (time) => {
+          const d = new Date((Number(time) || 0) * 1000);
+          return new Intl.DateTimeFormat('en-IN', {
+            timeZone: 'Asia/Kolkata',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+          }).format(d);
+        }
+      }
+    });
+
+    const lineSeries = chart.addLineSeries({ color: '#22d3ee', lineWidth: 2 });
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#22c55e',
+      downColor: '#ef4444',
+      borderVisible: false,
+      wickUpColor: '#22c55e',
+      wickDownColor: '#ef4444',
+    });
+
+    window.__mode = 'line';
+    window.setMode = function(mode) {
+      window.__mode = (mode === 'candlestick') ? 'candlestick' : 'line';
+      if (window.__mode === 'candlestick') {
+        lineSeries.applyOptions({ visible: false });
+        candleSeries.applyOptions({ visible: true });
+      } else {
+        lineSeries.applyOptions({ visible: true });
+        candleSeries.applyOptions({ visible: false });
+      }
+    };
+
+    window.setSeriesData = function(payload) {
+      lineSeries.setData(payload.line || []);
+      candleSeries.setData(payload.candles || []);
+      chart.timeScale().fitContent();
+      window.setMode(window.__mode);
+    };
+
+    window.updateLive = function(point) {
+      if (point.line) lineSeries.update(point.line);
+      if (point.candle) candleSeries.update(point.candle);
+    };
+
+    new ResizeObserver(() => {
+      chart.applyOptions({ width: root.clientWidth, height: root.clientHeight });
+    }).observe(root);
+    }
+  </script>
+</body>
+</html>
+            """
+        )
+        self._layout.addWidget(self._view, 1)
+
+    def _on_loaded(self, ok):
+        self._loaded = bool(ok)
+        if not self._loaded:
+            self._switch_to_fallback()
+            return
+        self._view.page().runJavaScript("window.__lw_ready === true", self._after_ready_check)
+
+    def _after_ready_check(self, ready):
+        if ready is not True:
+            self._switch_to_fallback()
+            return
+        self._run_js(f"window.setMode('{self._chart_type}')")
+        if self._last_history:
+            self._run_js(f"window.setSeriesData({json.dumps(self._last_history)})")
+
+    def _switch_to_fallback(self):
+        if self._fallback is not None:
+            return
+        self._fallback = PriceChartWidget()
+        self._fallback.set_timeframe(self._timeframe)
+        self._fallback.set_chart_type(self._chart_type)
+        self._fallback.set_active_token(self._active_token)
+        if self._view is not None:
+            self._view.setParent(None)
+        self._layout.addWidget(self._fallback, 1)
+        if self._last_history and self._active_token:
+            self._fallback.set_history(
+                self._active_token,
+                [point.get("value") for point in self._last_history.get("line", [])],
+                [(c.get("open"), c.get("high"), c.get("low"), c.get("close")) for c in self._last_history.get("candles", [])],
+                [str(p.get("time", "")) for p in self._last_history.get("line", [])],
+            )
+
+    def _run_js(self, script):
+        if HAS_WEBENGINE and self._loaded:
+            self._view.page().runJavaScript(script)
+
+    def set_active_token(self, token):
+        token = str(token) if token else None
+        if token != self._active_token:
+            self._active_token = token
+            self._qt_has_data = False
+            if self._qt_chart:
+                try:
+                    self._qt_chart.set(pd.DataFrame(columns=["time", "open", "high", "low", "close"]))
+                    if self._qt_line:
+                        self._qt_line.set(pd.DataFrame(columns=["time", "line"]))
+                except Exception:
+                    pass
+            if self._fallback:
+                self._fallback.set_active_token(token)
+            else:
+                self._last_history = {"line": [], "candles": []}
+                self._run_js("window.setSeriesData({line: [], candles: []})")
+
+    def set_timeframe(self, tf):
+        self._timeframe = tf
+        if self._qt_chart:
+            try:
+                self._qt_chart.time_scale(time_visible=True, seconds_visible=True)
+            except Exception:
+                pass
+        if self._fallback:
+            self._fallback.set_timeframe(tf)
+
+    def set_chart_type(self, chart_type):
+        self._chart_type = "candlestick" if chart_type == "candlestick" else "line"
+        if self._qt_chart:
+            if self._active_token and (self._qt_last_prices or self._qt_last_candles):
+                self.set_history(self._active_token, self._qt_last_prices, self._qt_last_candles, self._qt_last_times)
+            return
+        if self._fallback:
+            self._fallback.set_chart_type(self._chart_type)
+        else:
+            self._run_js(f"window.setMode('{self._chart_type}')")
+
+    def set_history(self, token, prices, candles=None, times=None):
+        if str(token) != str(self._active_token):
+            return
+        self._qt_last_prices = list(prices or [])
+        self._qt_last_candles = list(candles or [])
+        self._qt_last_times = list(times or [])
+        if self._qt_chart:
+            ts_list = times if isinstance(times, list) else []
+            step_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+            step = step_map.get(self._timeframe, 300)
+            base_epoch = int(datetime.now(tz=IST).timestamp())
+            count = max(len(prices or []), len(candles or []), 1)
+            fallback_start = base_epoch - step * count
+
+            candle_rows = []
+            if candles:
+                for i, c in enumerate(candles):
+                    if not isinstance(c, (list, tuple)) or len(c) < 4:
+                        continue
+                    t = _to_epoch_seconds_ist(ts_list[i] if i < len(ts_list) else None)
+                    if t is None:
+                        t = fallback_start + (i + 1) * step
+                    candle_rows.append(
+                        {
+                            "time": datetime.fromtimestamp(int(t), tz=IST).replace(tzinfo=None),
+                            "open": float(c[0]),
+                            "high": float(c[1]),
+                            "low": float(c[2]),
+                            "close": float(c[3]),
+                        }
+                    )
+
+            line_rows = []
+            for i, p in enumerate(prices or []):
+                v = _to_float(p)
+                if v is None:
+                    continue
+                t = _to_epoch_seconds_ist(ts_list[i] if i < len(ts_list) else None)
+                if t is None:
+                    t = fallback_start + (i + 1) * step
+                line_rows.append(
+                    {"time": datetime.fromtimestamp(int(t), tz=IST).replace(tzinfo=None), "line": float(v)}
+                )
+
+            try:
+                if self._chart_type == "candlestick":
+                    df_c = pd.DataFrame(candle_rows, columns=["time", "open", "high", "low", "close"])
+                    self._qt_chart.set(df_c)
+                    if self._qt_line:
+                        self._qt_line.set(pd.DataFrame(columns=["time", "line"]))
+                else:
+                    # Keep candles empty for pure line mode.
+                    self._qt_chart.set(pd.DataFrame(columns=["time", "open", "high", "low", "close"]))
+                    if self._qt_line is None:
+                        self._qt_line = self._qt_chart.create_line("line")
+                    df_l = pd.DataFrame(line_rows, columns=["time", "line"])
+                    self._qt_line.set(df_l)
+                self._qt_has_data = True
+            except Exception:
+                pass
+            return
+        if self._fallback:
+            self._fallback.set_history(token, prices, candles, times)
+            return
+
+        line_data = []
+        candle_data = []
+        ts_list = times if isinstance(times, list) else []
+        step_map = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+        step = step_map.get(self._timeframe, 300)
+        base_epoch = int(datetime.now(tz=IST).timestamp())
+        fallback_start = base_epoch - step * max(len(prices or []), len(candles or []), 1)
+        if candles:
+            for i, c in enumerate(candles):
+                if not isinstance(c, (list, tuple)) or len(c) < 4:
+                    continue
+                t = _to_epoch_seconds_ist(ts_list[i] if i < len(ts_list) else None)
+                if t is None:
+                    t = fallback_start + (i + 1) * step
+                candle_data.append({"time": int(t), "open": float(c[0]), "high": float(c[1]), "low": float(c[2]), "close": float(c[3])})
+        for i, p in enumerate(prices or []):
+            v = _to_float(p)
+            if v is None:
+                continue
+            t = _to_epoch_seconds_ist(ts_list[i] if i < len(ts_list) else None)
+            if t is None:
+                t = fallback_start + (i + 1) * step
+            line_data.append({"time": int(t), "value": float(v)})
+
+        self._last_history = {"line": line_data, "candles": candle_data}
+        self._run_js(f"window.setSeriesData({json.dumps(self._last_history)})")
+
+    def push_price(self, token, ltp, ts=None):
+        if str(token) != str(self._active_token):
+            return
+        if self._qt_chart:
+            value = _to_float(ltp)
+            t = _to_epoch_seconds_ist(ts)
+            if value is None:
+                return
+            if t is None:
+                t = int(datetime.now(tz=IST).timestamp())
+            dt = datetime.fromtimestamp(int(t), tz=IST).replace(tzinfo=None)
+            try:
+                if self._chart_type == "candlestick":
+                    if not self._qt_has_data:
+                        seed = pd.DataFrame([{"time": dt, "open": value, "high": value, "low": value, "close": value}])
+                        self._qt_chart.set(seed)
+                        self._qt_has_data = True
+                    else:
+                        self._qt_chart.update_from_tick(pd.Series({"time": dt, "price": value}))
+                else:
+                    if self._qt_line is None:
+                        self._qt_line = self._qt_chart.create_line("line")
+                    if not self._qt_has_data:
+                        self._qt_line.set(pd.DataFrame([{"time": dt, "line": value}]))
+                        self._qt_has_data = True
+                    else:
+                        self._qt_line.update(pd.Series({"time": dt, "line": value}))
+            except Exception:
+                pass
+            return
+        if self._fallback:
+            self._fallback.push_price(token, ltp, ts)
+            return
+        value = _to_float(ltp)
+        t = _to_epoch_seconds_ist(ts)
+        if value is None or t is None:
+            return
+        point = {
+            "line": {"time": int(t), "value": float(value)},
+            "candle": {"time": int(t), "open": float(value), "high": float(value), "low": float(value), "close": float(value)},
+        }
+        self._run_js(f"window.updateLive({json.dumps(point)})")
+
+
+class LoginDialog(QDialog):
+    def __init__(self, parent=None, defaults=None):
+        super().__init__(parent)
+        self.setWindowTitle("Login")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        cfg = defaults or {}
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.username = QLineEdit(cfg.get("user", ""))
+        self.session_pwd = QLineEdit(cfg.get("s_pwd", ""))
+        self.session_pwd.setEchoMode(QLineEdit.Password)
+        self.user_pwd = QLineEdit(cfg.get("pwd", ""))
+        self.user_pwd.setEchoMode(QLineEdit.Password)
+        self.procli = QLineEdit(cfg.get("procli", "0"))
+        self.ac_no = QLineEdit(cfg.get("ac_no", ""))
+        self.rest_ip = QLineEdit(cfg.get("rest_ip", "127.0.0.1"))
+        self.rest_port = QLineEdit(cfg.get("rest_port", "80"))
+        self.is_secure = QCheckBox("Secure")
+        self.is_secure.setChecked(bool(cfg.get("is_secure", False)))
+        self.is_base64 = QCheckBox("Base64")
+        self.is_base64.setChecked(bool(cfg.get("is_base_64", False)))
+        self.iris = QCheckBox("IRIS")
+        self.iris.setChecked(bool(cfg.get("iris", True)))
+
+        form.addRow("Username", self.username)
+        form.addRow("Session Password", self.session_pwd)
+        form.addRow("Trading Password", self.user_pwd)
+        form.addRow("Pro Client", self.procli)
+        form.addRow("Account Number", self.ac_no)
+        form.addRow("REST IP", self.rest_ip)
+        form.addRow("REST Port", self.rest_port)
+        form.addRow("", self.is_secure)
+        form.addRow("", self.is_base64)
+        form.addRow("", self.iris)
+
+        layout.addLayout(form)
+
+        self.btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.btns.button(QDialogButtonBox.Ok).setText("Login")
+        self.btns.accepted.connect(self._validate_and_accept)
+        self.btns.rejected.connect(self.reject)
+        layout.addWidget(self.btns)
+
+    def _validate_and_accept(self):
+        required = {
+            "Username": self.username.text().strip(),
+            "Session Password": self.session_pwd.text().strip(),
+            "Trading Password": self.user_pwd.text().strip(),
+            "Account Number": self.ac_no.text().strip(),
+        }
+        missing = [label for label, value in required.items() if not value]
+        if missing:
+            QMessageBox.warning(self, "Missing Fields", f"Please fill: {', '.join(missing)}")
+            return
+        self.accept()
+
+    def get_credentials(self):
+        return {
+            "user": self.username.text().strip(),
+            "s_pwd": self.session_pwd.text().strip(),
+            "pwd": self.user_pwd.text().strip(),
+            "procli": self.procli.text().strip() or "0",
+            "ac_no": self.ac_no.text().strip(),
+            "is_secure": self.is_secure.isChecked(),
+            "is_base_64": self.is_base64.isChecked(),
+            "rest_ip": self.rest_ip.text().strip() or "127.0.0.1",
+            "rest_port": self.rest_port.text().strip() or "80",
+            "iris": self.iris.isChecked(),
+        }
 
 
 class TradingWindow(QMainWindow):
@@ -317,11 +1013,19 @@ class TradingWindow(QMainWindow):
         self.bus.log.connect(self._append_log)
         self.bus.error.connect(self._show_error)
         self.bus.status.connect(self._set_status)
+        self.bus.login_state.connect(self._set_logged_in_state)
+        self.bus.session_info.connect(self._set_session_info)
+        self.bus.ohlc_series.connect(self._on_ohlc_series)
+        self.bus.account_table.connect(self._set_account_table)
+        self.bus.refresh_orderbook.connect(self.refresh_active_orderbook)
         self.bus.account_text.connect(self.account_output_set_text)
         self.bus.clear_watch.connect(self._clear_watch_ui)
         self.bus.remove_tokens.connect(self.model_remove_tokens)
 
         self.model = MarketTableModel()
+        self.account_model = AccountTableModel()
+        self.account_popup = None
+        self.account_popup_table = None
         self.api = None
         self.streaming_active = False
         self.stream_thread = None
@@ -329,12 +1033,52 @@ class TradingWindow(QMainWindow):
         self.current_tokens = set()
         self.active_token = None
         self._perf_counter = 0
+        self.contract_df = None
+        self.contract_lookup = {}
+        self.token_metadata = {}
+        self.primary_index_token = "101999957"
+        self.index_tokens = {self.primary_index_token}
+        self._ohlc_request_key = None
+        self.chart_popup = None
+        self.chart_popup_widget = None
+        self.popup_interval_combo = None
+        self.popup_charttype_combo = None
+        self.popup_ordtype_combo = None
+        self.popup_qty_input = None
+        self.popup_price_input = None
+        self.popup_token_label = None
+        self._watchlist_delete_shortcut = None
+        self.login_config = {
+            "user": "",
+            "s_pwd": "",
+            "pwd": "",
+            "procli": "0",
+            "ac_no": "",
+            "is_secure": False,
+            "is_base_64": False,
+            "rest_ip": "127.0.0.1",
+            "rest_port": "80",
+            "iris": True,
+        }
+        self.timeframe_to_interval = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
+        self.active_timeframe = "5m"
+        self.chart_mode = "line"
+        self.active_orderbook_key = "all"
+        self.ws_server_time_text = "-"
+        self.account_auto_refresh_timer = QTimer(self)
+        self.account_auto_refresh_timer.setInterval(4000)
+        self.account_auto_refresh_timer.timeout.connect(lambda: self.refresh_active_orderbook(auto=True))
+        self._account_refresh_inflight = False
 
         self._build_ui()
+        self._set_logged_in_state(False)
+        self._set_session_info("Not logged in")
+        self._setup_shortcuts()
 
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self._drain_ui_queue)
         self.ui_timer.start(40)
+        QTimer.singleShot(0, self.open_login_popup)
 
     def _build_ui(self):
         root = QWidget()
@@ -345,19 +1089,27 @@ class TradingWindow(QMainWindow):
 
         base.addWidget(self._build_top_bar())
 
-        vertical = QSplitter(Qt.Vertical)
-        upper = QSplitter(Qt.Horizontal)
+        self.vertical_splitter = QSplitter(Qt.Vertical)
+        self.vertical_splitter.setChildrenCollapsible(False)
+        self.vertical_splitter.setHandleWidth(8)
 
-        upper.addWidget(self._build_watchlist_panel())
-        upper.addWidget(self._build_chart_panel())
-        upper.addWidget(self._build_trade_panel())
-        upper.setSizes([430, 890, 360])
+        self.upper_splitter = QSplitter(Qt.Horizontal)
+        self.upper_splitter.setChildrenCollapsible(False)
+        self.upper_splitter.setHandleWidth(8)
 
-        vertical.addWidget(upper)
-        vertical.addWidget(self._build_bottom_console())
-        vertical.setSizes([730, 250])
+        self.upper_splitter.addWidget(self._build_watchlist_panel())
+        self.upper_splitter.addWidget(self._build_trade_panel())
+        self.upper_splitter.setStretchFactor(0, 7)
+        self.upper_splitter.setStretchFactor(1, 4)
+        self.upper_splitter.setSizes([980, 520])
 
-        base.addWidget(vertical, 1)
+        self.vertical_splitter.addWidget(self.upper_splitter)
+        self.vertical_splitter.addWidget(self._build_bottom_console())
+        self.vertical_splitter.setStretchFactor(0, 3)
+        self.vertical_splitter.setStretchFactor(1, 1)
+        self.vertical_splitter.setSizes([760, 260])
+
+        base.addWidget(self.vertical_splitter, 1)
 
         self.setStyleSheet(
             """
@@ -481,7 +1233,8 @@ class TradingWindow(QMainWindow):
         self.focus_token_input = QLineEdit()
         self.focus_token_input.setPlaceholderText("Type token and press Enter")
         self.focus_token_input.returnPressed.connect(self.focus_token_from_toolbar)
-        self.focus_token_input.setFixedWidth(180)
+        self.focus_token_input.setMinimumWidth(180)
+        self.focus_token_input.setMaximumWidth(300)
         row.addWidget(self.focus_token_input)
 
         btn_focus = QPushButton("Go")
@@ -496,17 +1249,46 @@ class TradingWindow(QMainWindow):
         self.perf_badge = QLabel("ticks/s: -  backlog: -")
         self.perf_badge.setStyleSheet("color: #93c5fd; font-weight: 600;")
         row.addWidget(self.perf_badge)
+        self.server_time_label = QLabel("WS Time: -")
+        self.server_time_label.setStyleSheet("color: #a7f3d0; font-weight: 600;")
+        row.addWidget(self.server_time_label)
+        row.addSpacing(10)
+
+        self.active_symbol_label = QLabel("Token: -")
+        self.ltp_label = QLabel("LTP: -")
+        self.chg_label = QLabel("Change: -")
+        self.vol_label = QLabel("Volume: -")
+        self.oi_label = QLabel("OI: -")
+        self.time_label = QLabel("LUT: -")
+        self.ltp_label.setStyleSheet("font-size: 13px; font-weight: 700; color: #fef08a;")
+        self.chg_label.setStyleSheet("font-size: 13px; font-weight: 700; color: #cbd5e1;")
+        for widget in (self.active_symbol_label, self.ltp_label, self.chg_label, self.vol_label, self.oi_label, self.time_label):
+            row.addWidget(widget)
+            row.addSpacing(6)
         row.addStretch(1)
         return bar
 
     def _build_watchlist_panel(self):
         panel = QGroupBox("Watchlist")
+        panel.setMinimumWidth(360)
+        self.watchlist_panel = panel
         layout = QVBoxLayout(panel)
 
         self.token_input = QPlainTextEdit()
-        self.token_input.setPlaceholderText("Enter tokens separated by comma/newline")
+        self.token_input.setPlaceholderText("Enter token or EXCHANGE:SYMBOL separated by comma/newline")
         self.token_input.setFixedHeight(90)
         layout.addWidget(self.token_input)
+
+        resolve_row = QHBoxLayout()
+        resolve_row.addWidget(QLabel("Exchange"))
+        self.exchange_input = QComboBox()
+        self.exchange_input.addItems(["NSE", "BSE", "MCX"])
+        resolve_row.addWidget(self.exchange_input)
+        self.btn_refresh_contracts = QPushButton("Refresh Contracts")
+        self.btn_refresh_contracts.clicked.connect(self.refresh_contract_data)
+        resolve_row.addWidget(self.btn_refresh_contracts)
+        resolve_row.addStretch(1)
+        layout.addLayout(resolve_row)
 
         controls = QHBoxLayout()
         self.btn_start_stream = QPushButton("Start Stream")
@@ -535,102 +1317,33 @@ class TradingWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.clicked.connect(self._on_table_clicked)
+        self._watchlist_delete_shortcut = QShortcut(QKeySequence("Del"), self.table)
+        self._watchlist_delete_shortcut.activated.connect(self.unsubscribe_selected)
         layout.addWidget(self.table, 1)
 
         return panel
 
-    def _build_chart_panel(self):
-        panel = QGroupBox("Chart")
-        layout = QVBoxLayout(panel)
-
-        top = QHBoxLayout()
-        self.active_symbol_label = QLabel("Token: -")
-        self.active_symbol_label.setStyleSheet("font-size: 15px; font-weight: 800; color: #dbeafe;")
-        self.ltp_label = QLabel("LTP: -")
-        self.chg_label = QLabel("Change: -")
-        self.vol_label = QLabel("Volume: -")
-        self.oi_label = QLabel("OI: -")
-        self.time_label = QLabel("LUT: -")
-        self.ltp_label.setStyleSheet("font-size: 15px; font-weight: 800; color: #fef08a;")
-        self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #cbd5e1;")
-
-        for widget in (self.active_symbol_label, self.ltp_label, self.chg_label, self.vol_label, self.oi_label, self.time_label):
-            top.addWidget(widget)
-            top.addSpacing(10)
-
-        top.addStretch(1)
-
-        tf_group = QButtonGroup(self)
-        for tf in ("1m", "5m", "15m", "1h"):
-            btn = QPushButton(tf)
-            btn.setCheckable(True)
-            if tf == "5m":
-                btn.setChecked(True)
-            btn.clicked.connect(lambda checked, val=tf: self.set_timeframe(val))
-            tf_group.addButton(btn)
-            top.addWidget(btn)
-
-        layout.addLayout(top)
-        self.chart = PriceChartWidget()
-        layout.addWidget(self.chart, 1)
-        return panel
-
     def _build_trade_panel(self):
         container = QWidget()
+        container.setMinimumWidth(360)
         col = QVBoxLayout(container)
         col.setContentsMargins(0, 0, 0, 0)
 
         conn = QGroupBox("Connection")
         form = QFormLayout(conn)
 
-        self.username = QLineEdit()
-        self.session_pwd = QLineEdit()
-        self.session_pwd.setEchoMode(QLineEdit.Password)
-        self.user_pwd = QLineEdit()
-        self.user_pwd.setEchoMode(QLineEdit.Password)
-        self.procli = QLineEdit("0")
-        self.ac_no = QLineEdit()
-        self.rest_ip = QLineEdit("127.0.0.1")
-        self.rest_port = QLineEdit("80")
-        self.req_data = QLineEdit("ltp")
-        self.ping_interval = QLineEdit("20")
-        self.ping_timeout = QLineEdit("10")
-        self.is_secure = QCheckBox("Secure")
-        self.is_base64 = QCheckBox("Base64")
-        self.iris = QCheckBox("IRIS")
-        self.iris.setChecked(True)
+        self.session_info_label = QLabel("Not logged in")
+        self.session_info_label.setStyleSheet("font-weight: 700; color: #fca5a5;")
+        form.addRow("Session", self.session_info_label)
 
-        form.addRow("Username", self.username)
-        form.addRow("Session Password", self.session_pwd)
-        form.addRow("Trading Password", self.user_pwd)
-        form.addRow("Pro Client", self.procli)
-        form.addRow("Account Number", self.ac_no)
-        form.addRow("REST IP", self.rest_ip)
-        form.addRow("REST Port", self.rest_port)
-        form.addRow("Req Data", self.req_data)
-        form.addRow("Ping Interval", self.ping_interval)
-        form.addRow("Ping Timeout", self.ping_timeout)
-        form.addRow("", self.is_secure)
-        form.addRow("", self.is_base64)
-        form.addRow("", self.iris)
-
-        btn_row = QHBoxLayout()
-        btn_connect = QPushButton("Connect")
-        btn_connect.setObjectName("primary")
-        btn_connect.clicked.connect(self.connect_api)
-        btn_disconnect = QPushButton("Disconnect")
-        btn_disconnect.setObjectName("danger")
-        btn_disconnect.clicked.connect(self.disconnect_api)
-        btn_time = QPushButton("Server Time")
-        btn_time.clicked.connect(self.fetch_server_time)
-        btn_row.addWidget(btn_connect)
-        btn_row.addWidget(btn_disconnect)
-        btn_row.addWidget(btn_time)
-        form.addRow(btn_row)
+        self.req_mode_label = QLabel("RAW (allresp)")
+        self.req_mode_label.setStyleSheet("font-weight: 700; color: #93c5fd;")
+        form.addRow("Req Data", self.req_mode_label)
 
         col.addWidget(conn)
 
         ticket = QGroupBox("Order Ticket")
+        self.ticket_group = ticket
         order_form = QFormLayout(ticket)
 
         self.ord_token = QLineEdit()
@@ -640,6 +1353,8 @@ class TradingWindow(QMainWindow):
         self.ord_price = QLineEdit("0")
         self.ord_buysell = QLineEdit("BUY")
         self.ord_type = QLineEdit("LIMIT")
+        self.ord_buysell.setPlaceholderText("1/BUY or 2/SELL")
+        self.ord_type.setPlaceholderText("1/LIMIT, 2/MARKET, 3/IOC")
         self.ord_trig = QLineEdit("0")
         self.ord_exchange = QLineEdit("NSE")
         self.ord_validity = QLineEdit("0")
@@ -687,26 +1402,7 @@ class TradingWindow(QMainWindow):
 
     def _build_bottom_console(self):
         tabs = QTabWidget()
-
-        account_tab = QWidget()
-        account_layout = QVBoxLayout(account_tab)
-        action_row = QHBoxLayout()
-        for text, handler in (
-            ("Orderbook All", self.fetch_orderbook_all),
-            ("Orderbook Traded", self.fetch_orderbook_traded),
-            ("Orderbook Pending", self.fetch_orderbook_pending),
-            ("Net Positions", self.fetch_positions),
-            ("Margin", self.fetch_margin),
-            ("Holdings", self.fetch_holdings),
-        ):
-            btn = QPushButton(text)
-            btn.clicked.connect(handler)
-            action_row.addWidget(btn)
-        action_row.addStretch(1)
-        account_layout.addLayout(action_row)
-        self.account_output = QPlainTextEdit()
-        self.account_output.setReadOnly(True)
-        account_layout.addWidget(self.account_output, 1)
+        self.bottom_tabs = tabs
 
         logs_tab = QWidget()
         logs_layout = QVBoxLayout(logs_tab)
@@ -715,7 +1411,6 @@ class TradingWindow(QMainWindow):
         self.log_output.setStyleSheet("background-color: #0a111d; color: #9fd3ff;")
         logs_layout.addWidget(self.log_output, 1)
 
-        tabs.addTab(account_tab, "Account")
         tabs.addTab(logs_tab, "Logs")
         return tabs
 
@@ -737,22 +1432,182 @@ class TradingWindow(QMainWindow):
         self.status_label.setStyleSheet(style)
         self.status_label.setText(status)
 
+    def _set_session_info(self, text):
+        self.session_info_label.setText(text)
+        if text.lower().startswith("logged in"):
+            self.session_info_label.setStyleSheet("font-weight: 700; color: #86efac;")
+        else:
+            self.session_info_label.setStyleSheet("font-weight: 700; color: #fca5a5;")
+
+    def _set_logged_in_state(self, enabled):
+        self.watchlist_panel.setEnabled(enabled)
+        self.ticket_group.setEnabled(enabled)
+        if not enabled:
+            self.account_model.clear()
+
     def _clear_watch_ui(self):
         self.model.clear()
-        self.chart.set_active_token(None)
+        if self.chart_popup_widget:
+            self.chart_popup_widget.set_active_token(None)
         self.active_token = None
         self.current_tokens.clear()
         self._set_quote_strip(None)
+        self.ws_server_time_text = "-"
+        self.server_time_label.setText("WS Time: -")
 
     def model_remove_tokens(self, tokens):
         self.model.remove_tokens(tokens)
         if self.active_token and self.active_token in {str(token) for token in tokens}:
             self.active_token = None
-            self.chart.set_active_token(None)
+            if self.chart_popup_widget:
+                self.chart_popup_widget.set_active_token(None)
             self._set_quote_strip(None)
 
     def account_output_set_text(self, text):
-        self.account_output.setPlainText(text)
+        return
+
+    def _ensure_account_popup(self, title):
+        if self.account_popup is None:
+            self.account_popup = QDialog(self)
+            self.account_popup.setModal(False)
+            self.account_popup.resize(1200, 700)
+            self.account_popup.finished.connect(lambda _: self.account_auto_refresh_timer.stop())
+            layout = QVBoxLayout(self.account_popup)
+            self.account_popup_table = QTableView()
+            self.account_popup_table.setModel(self.account_model)
+            self.account_popup_table.setAlternatingRowColors(True)
+            self.account_popup_table.verticalHeader().setVisible(False)
+            self.account_popup_table.setSelectionBehavior(QTableView.SelectRows)
+            self.account_popup_table.setSelectionMode(QTableView.SingleSelection)
+            self.account_popup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            self.account_popup_table.horizontalHeader().setStretchLastSection(True)
+            layout.addWidget(self.account_popup_table, 1)
+        self.account_popup.setWindowTitle(title)
+        self.account_popup.show()
+        self.account_popup.raise_()
+        self.account_popup.activateWindow()
+        if self.api and not self.account_auto_refresh_timer.isActive():
+            self.account_auto_refresh_timer.start()
+
+    def _set_account_table(self, title, columns, rows):
+        self.account_model.set_records(columns, rows)
+        self._ensure_account_popup(title)
+        self.bus.log.emit(f"{title} table updated: {len(rows)} row(s).")
+
+    @staticmethod
+    def _rows_from_payload(data):
+        if isinstance(data, list):
+            rows = [item for item in data if isinstance(item, dict)]
+            if rows:
+                columns = list(dict.fromkeys(key for row in rows for key in row.keys()))
+                return columns, rows
+        if isinstance(data, dict):
+            for key in ("data", "records", "rows", "orderbook", "orderBook", "stockDetails"):
+                value = data.get(key)
+                if isinstance(value, list) and value and isinstance(value[0], dict):
+                    columns = list(dict.fromkeys(k for row in value for k in row.keys()))
+                    return columns, value
+        return [], []
+
+    def refresh_active_orderbook(self, auto=False):
+        if self._account_refresh_inflight:
+            return
+        key = (self.active_orderbook_key or "").lower()
+        if key == "all":
+            self.fetch_orderbook_all(log_fetch=not auto)
+        elif key == "traded":
+            self.fetch_orderbook_traded(log_fetch=not auto)
+        elif key == "rejected":
+            self.fetch_orderbook_rejected(log_fetch=not auto)
+        elif key == "pending":
+            self.fetch_orderbook_pending(log_fetch=not auto)
+        elif key == "positions":
+            self.fetch_positions(log_fetch=not auto)
+        elif key == "holdings":
+            self.fetch_holdings(log_fetch=not auto)
+        elif key == "margin":
+            self.fetch_margin(log_fetch=not auto)
+
+    def _ensure_chart_popup(self):
+        if self.chart_popup is None:
+            self.chart_popup = QDialog(self)
+            self.chart_popup.setModal(False)
+            self.chart_popup.resize(1250, 760)
+            self.chart_popup.setWindowTitle("Chart Popup")
+            layout = QVBoxLayout(self.chart_popup)
+
+            control_row = QHBoxLayout()
+            self.popup_token_label = QLabel("Token: -")
+            self.popup_token_label.setStyleSheet("font-weight: 700; color: #dbeafe;")
+            control_row.addWidget(self.popup_token_label)
+            control_row.addSpacing(10)
+            control_row.addWidget(QLabel("Interval"))
+            self.popup_interval_combo = QComboBox()
+            self.popup_interval_combo.addItems(["1m", "5m", "15m", "1h"])
+            self.popup_interval_combo.setCurrentText(self.active_timeframe)
+            self.popup_interval_combo.currentTextChanged.connect(self.set_timeframe)
+            control_row.addWidget(self.popup_interval_combo)
+            control_row.addSpacing(10)
+            control_row.addWidget(QLabel("Chart"))
+            self.popup_charttype_combo = QComboBox()
+            self.popup_charttype_combo.addItems(["Line", "Candlestick"])
+            self.popup_charttype_combo.setCurrentText("Candlestick" if self.chart_mode == "candlestick" else "Line")
+            self.popup_charttype_combo.currentTextChanged.connect(self.set_chart_type)
+            control_row.addWidget(self.popup_charttype_combo)
+            control_row.addSpacing(10)
+            control_row.addWidget(QLabel("Order Type"))
+            self.popup_ordtype_combo = QComboBox()
+            self.popup_ordtype_combo.addItems(["LIMIT", "MARKET", "IOC"])
+            self.popup_ordtype_combo.currentTextChanged.connect(
+                lambda val: self.popup_price_input.setText("0") if str(val).upper() == "MARKET" else None
+            )
+            control_row.addWidget(self.popup_ordtype_combo)
+            control_row.addWidget(QLabel("Qty"))
+            self.popup_qty_input = QLineEdit("1")
+            self.popup_qty_input.setMaximumWidth(80)
+            control_row.addWidget(self.popup_qty_input)
+            control_row.addWidget(QLabel("Price"))
+            self.popup_price_input = QLineEdit("0")
+            self.popup_price_input.setMaximumWidth(120)
+            control_row.addWidget(self.popup_price_input)
+            popup_buy_btn = QPushButton("BUY")
+            popup_buy_btn.setObjectName("buy")
+            popup_buy_btn.clicked.connect(lambda: self.place_order_from_popup("BUY"))
+            popup_sell_btn = QPushButton("SELL")
+            popup_sell_btn.setObjectName("sell")
+            popup_sell_btn.clicked.connect(lambda: self.place_order_from_popup("SELL"))
+            control_row.addWidget(popup_buy_btn)
+            control_row.addWidget(popup_sell_btn)
+            control_row.addStretch(1)
+            layout.addLayout(control_row)
+
+            self.chart_popup_widget = LightweightChartWidget()
+            self.chart_popup_widget.set_timeframe(self.active_timeframe)
+            self.chart_popup_widget.set_chart_type(self.chart_mode)
+            layout.addWidget(self.chart_popup_widget, 1)
+        self.chart_popup.show()
+        self.chart_popup.raise_()
+        self.chart_popup.activateWindow()
+
+    def open_chart_popup_and_start_broadcast(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+
+        self._ensure_chart_popup()
+        if self.active_token:
+            self.chart_popup_widget.set_active_token(self.active_token)
+
+        tokens = list(self.current_tokens)
+        if not tokens:
+            parsed, unresolved = self._parse_tokens()
+            tokens.extend(parsed)
+            if unresolved:
+                self.bus.log.emit(f"Unresolved entries skipped: {', '.join(unresolved[:12])}")
+        if self.active_token and self.active_token not in tokens:
+            tokens.append(self.active_token)
+
+        self._start_stream_for_tokens(tokens, source_label="F10")
 
     def _set_quote_strip(self, row):
         if not row:
@@ -763,9 +1618,17 @@ class TradingWindow(QMainWindow):
             self.oi_label.setText("OI: -")
             self.time_label.setText("LUT: -")
             self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #cbd5e1;")
+            if self.popup_token_label:
+                self.popup_token_label.setText(f"Token: {self.active_token or '-'} | LTP: - | WS: {self.ws_server_time_text}")
             return
 
-        token, name, ltp, change, _, lut, volume, oi = row
+        token = row.get("symbol")
+        name = row.get("name")
+        ltp = row.get("ltp")
+        change = row.get("change")
+        lut = row.get("lut")
+        volume = row.get("tot_vol")
+        oi = row.get("oi")
         self.active_symbol_label.setText(f"Token: {token}  |  {name or '-'}")
         self.ltp_label.setText(f"LTP: {_format_number(ltp, 2)}")
         chg = _to_float(change)
@@ -784,6 +1647,23 @@ class TradingWindow(QMainWindow):
         self.vol_label.setText(f"Volume: {_format_number(volume, 0)}")
         self.oi_label.setText(f"OI: {_format_number(oi, 0)}")
         self.time_label.setText(f"LUT: {lut if lut not in (None, '') else '-'}")
+        if self.popup_token_label:
+            self.popup_token_label.setText(
+                f"Token: {token} | {name or '-'} | LTP: {_format_number(ltp, 2)} | WS: {self.ws_server_time_text}"
+            )
+
+    def _update_ws_server_time(self, ltt, lut):
+        text = _format_ws_time(lut) or _format_ws_time(ltt)
+        if not text:
+            return
+        self.ws_server_time_text = text
+        self.server_time_label.setText(f"WS Time: {text}")
+        if self.popup_token_label and self.active_token:
+            row = self.model.row_by_token(self.active_token)
+            if row:
+                self.popup_token_label.setText(
+                    f"Token: {row[0]} | {row[1] or '-'} | LTP: {_format_number(row[2], 2)} | WS: {text}"
+                )
 
     def _run_bg(self, fn, name):
         def runner():
@@ -796,31 +1676,209 @@ class TradingWindow(QMainWindow):
 
         mt.Thread(target=runner, daemon=True).start()
 
+    def _setup_shortcuts(self):
+        self._shortcuts = []
+        mappings = (
+            ("F3", self.fetch_orderbook_all),
+            ("F4", self.fetch_orderbook_traded),
+            ("F6", self.fetch_orderbook_pending),
+            ("Alt+F6", self.fetch_positions),
+            ("F7", self.fetch_holdings),
+            ("F8", self.fetch_margin),
+            ("F10", self.open_chart_popup_and_start_broadcast),
+        )
+        for key, handler in mappings:
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(handler)
+            self._shortcuts.append(shortcut)
+
+    @staticmethod
+    def _pick_column(columns, candidates):
+        col_map = {str(col).strip().lower(): col for col in columns}
+        for key in candidates:
+            matched = col_map.get(key)
+            if matched is not None:
+                return matched
+        return None
+
+    def _build_contract_lookup(self, df):
+        self.contract_df = df
+        self.contract_lookup.clear()
+        self.token_metadata.clear()
+        self.index_tokens.clear()
+        self.index_tokens.add(self.primary_index_token)
+        if df is None or getattr(df, "empty", True):
+            return
+
+        token_col = self._pick_column(df.columns, ("gtoken", "token", "symboltoken", "tokenno"))
+        symbol_col = self._pick_column(df.columns, ("tradingsymbol", "symbol", "tsym", "name", "sname"))
+        exchange_col = self._pick_column(df.columns, ("exchange", "exch", "exch_seg", "exchange_segment"))
+        name_col = self._pick_column(df.columns, ("name", "companyname", "description", "symbol", "tradingsymbol"))
+        asset_col = self._pick_column(df.columns, ("assettype", "asset_type", "instrumenttype", "segment", "series"))
+
+        if token_col is None:
+            self.bus.log.emit("Contract data loaded but token column not found.")
+            return
+
+        for _, row in df.iterrows():
+            token = str(row.get(token_col, "")).strip()
+            if not token:
+                continue
+            exchange = str(row.get(exchange_col, "")).strip().upper() if exchange_col else ""
+            symbol = str(row.get(symbol_col, "")).strip().upper() if symbol_col else ""
+            name = str(row.get(name_col, "")).strip() if name_col else symbol
+            asset_type = str(row.get(asset_col, "")).strip().upper() if asset_col else ""
+            if symbol:
+                key = f"{exchange}:{symbol}" if exchange else symbol
+                self.contract_lookup[key] = token
+                if symbol not in self.contract_lookup:
+                    self.contract_lookup[symbol] = token
+            self.token_metadata[token] = {"name": name or symbol, "exchange": exchange, "symbol": symbol}
+            meta_text = f"{exchange} {symbol} {name} {asset_type}".upper()
+            if ("INDEX" in meta_text) or any(idx in meta_text for idx in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY")):
+                self.index_tokens.add(token)
+
+    def refresh_contract_data(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Connect first.")
+            return
+
+        def task():
+            df = self.api.get_contract_data()
+            self._build_contract_lookup(df)
+            self.bus.log.emit(f"Contract data loaded: {len(self.token_metadata)} tokens.")
+
+        self._run_bg(task, "Contract Data")
+
+    def _resolve_tokens(self, entries):
+        resolved = []
+        unresolved = []
+        default_exchange = self.exchange_input.currentText().strip().upper() or "NSE"
+
+        for raw in entries:
+            item = str(raw).strip()
+            if not item:
+                continue
+
+            if item.isdigit():
+                resolved.append(item)
+                continue
+
+            exchange = default_exchange
+            symbol = item
+            if ":" in item:
+                parts = item.split(":", 1)
+                exchange = parts[0].strip().upper() or default_exchange
+                symbol = parts[1].strip()
+            symbol_key = symbol.upper()
+
+            token = self.contract_lookup.get(f"{exchange}:{symbol_key}") or self.contract_lookup.get(symbol_key)
+            if token:
+                resolved.append(str(token))
+            else:
+                unresolved.append(item)
+
+        return list(dict.fromkeys(resolved)), unresolved
+
+    def _name_for_token(self, token):
+        meta = self.token_metadata.get(str(token), {})
+        return meta.get("name", "")
+
     def _parse_tokens(self):
         raw = self.token_input.toPlainText().strip()
         if not raw:
-            return []
-        tokens = []
+            return [], []
+        entries = []
         for item in raw.replace("\n", ",").split(","):
-            token = item.strip()
-            if token:
-                tokens.append(token)
-        return list(dict.fromkeys(tokens))
+            value = item.strip()
+            if value:
+                entries.append(value)
+        return self._resolve_tokens(entries)
+
+    def _extract_ohlc_series(self, rows):
+        closes = []
+        candles = []
+        times = []
+        if not isinstance(rows, list):
+            return closes, candles, times
+        for row in rows:
+            opn = high = low = close = None
+            ts = None
+            close = None
+            if isinstance(row, dict):
+                opn = row.get("open", row.get("o", row.get("Open")))
+                high = row.get("high", row.get("h", row.get("High")))
+                low = row.get("low", row.get("l", row.get("Low")))
+                close = row.get("close", row.get("c", row.get("ltp", row.get("Close"))))
+                ts = row.get("time", row.get("datetime", row.get("timestamp", row.get("lut", row.get("ltt")))))
+            elif isinstance(row, (list, tuple)):
+                if len(row) > 4:
+                    opn, high, low, close = row[1], row[2], row[3], row[4]
+                    ts = row[0]
+                elif len(row) >= 4:
+                    opn, high, low, close = row[0], row[1], row[2], row[3]
+            elif isinstance(row, str):
+                parts = row.split("|") if "|" in row else row.split(",")
+                if len(parts) > 4:
+                    opn, high, low, close = parts[1], parts[2], parts[3], parts[4]
+                    ts = parts[0]
+                elif len(parts) >= 4:
+                    opn, high, low, close = parts[0], parts[1], parts[2], parts[3]
+                elif parts:
+                    close = parts[-1]
+
+            c_val = _to_float(close)
+            if c_val is not None:
+                closes.append(c_val)
+                times.append(str(ts) if ts is not None else "")
+
+            o_val = _to_float(opn)
+            h_val = _to_float(high)
+            l_val = _to_float(low)
+            if None not in (o_val, h_val, l_val, c_val):
+                candles.append((o_val, h_val, l_val, c_val))
+
+        return closes, candles, times
+
+    def _fetch_ohlc_for_token(self, token):
+        if not self.api or not token:
+            return
+        token = str(token)
+        interval = self.timeframe_to_interval.get(self.active_timeframe, 5)
+        date_key = datetime.now().strftime("%Y%m%d")
+        request_key = f"{token}:{interval}:{date_key}"
+        self._ohlc_request_key = request_key
+
+        def task():
+            rows = self.api.get_ohlc_data(token=token, date=date_key, interval=interval)
+            closes, candles, times = self._extract_ohlc_series(rows)
+            if closes:
+                self.bus.ohlc_series.emit(request_key, closes, candles, times)
+                self.bus.log.emit(f"OHLC loaded for token {token} ({self.active_timeframe}).")
+            else:
+                self.bus.log.emit(f"No OHLC data for token {token} ({self.active_timeframe}).")
+
+        self._run_bg(task, "OHLC")
+
+    def _on_ohlc_series(self, request_key, closes, candles, times):
+        if request_key != self._ohlc_request_key:
+            return
+        token = request_key.split(":", 1)[0]
+        if self.chart_popup_widget:
+            self.chart_popup_widget.set_history(token, closes, candles, times)
 
     def _normalize_tick(self, tick):
         if isinstance(tick, dict):
             token = tick.get("symbol")
             if token is None:
                 return None
-            return (
-                str(token),
-                tick.get("name", ""),
-                tick.get("ltp"),
-                tick.get("ltt"),
-                tick.get("lut"),
-                tick.get("tot_vol"),
-                tick.get("currentOI") or tick.get("oi"),
-            )
+            payload = dict(tick)
+            payload.pop("level2", None)
+            payload["symbol"] = str(token)
+            payload["name"] = payload.get("name", "") or self._name_for_token(token)
+            if "oi" not in payload and "currentOI" in payload:
+                payload["oi"] = payload.get("currentOI")
+            return payload
 
         if not isinstance(tick, (list, tuple)) or len(tick) == 0:
             return None
@@ -829,15 +1887,19 @@ class TradingWindow(QMainWindow):
         if token is None:
             return None
 
-        return (
-            str(token),
-            tick[1] if len(tick) > 1 else "",
-            tick[2] if len(tick) > 2 else None,
-            tick[3] if len(tick) > 3 else None,
-            tick[4] if len(tick) > 4 else None,
-            tick[5] if len(tick) > 5 else None,
-            tick[6] if len(tick) > 6 else None,
-        )
+        name = tick[1] if len(tick) > 1 else ""
+        if not name:
+            name = self._name_for_token(token)
+
+        return {
+            "symbol": str(token),
+            "name": name,
+            "ltp": tick[2] if len(tick) > 2 else None,
+            "ltt": tick[3] if len(tick) > 3 else None,
+            "lut": tick[4] if len(tick) > 4 else None,
+            "tot_vol": tick[5] if len(tick) > 5 else None,
+            "oi": tick[6] if len(tick) > 6 else None,
+        }
 
     def focus_token_from_toolbar(self):
         token = self.focus_token_input.text().strip()
@@ -862,33 +1924,117 @@ class TradingWindow(QMainWindow):
         token = str(token)
         self.active_token = token
         self.focus_token_input.setText(token)
-        self.chart.set_active_token(token)
+        self._ensure_chart_popup()
+        self.chart_popup_widget.set_active_token(token)
         row = self.model.row_by_token(token)
         self._set_quote_strip(row)
         if row:
-            self.ord_token.setText(str(row[0]))
-            self.ord_symbol.setText(str(row[1] or ""))
+            self.ord_token.setText(str(row.get("symbol", "")))
+            self.ord_symbol.setText(str(row.get("name", "") or ""))
+            if self.popup_token_label:
+                self.popup_token_label.setText(f"Token: {row.get('symbol')} | {row.get('name') or '-'}")
+            if self.popup_price_input:
+                ltp = _to_float(row.get("ltp"))
+                if ltp is not None and self.popup_ordtype_combo and self.popup_ordtype_combo.currentText() == "LIMIT":
+                    self.popup_price_input.setText(f"{ltp:.2f}")
+        elif self.popup_token_label:
+            self.popup_token_label.setText(f"Token: {token}")
+        self._fetch_ohlc_for_token(token)
 
     def set_timeframe(self, tf):
-        self.chart.set_timeframe(tf)
+        self.active_timeframe = tf
+        if self.popup_interval_combo and self.popup_interval_combo.currentText() != tf:
+            self.popup_interval_combo.setCurrentText(tf)
+        if self.chart_popup_widget:
+            self.chart_popup_widget.set_timeframe(tf)
+        if self.active_token:
+            self._fetch_ohlc_for_token(self.active_token)
 
-    def connect_api(self):
+    def set_chart_type(self, chart_type_text):
+        mode = "candlestick" if str(chart_type_text).strip().lower().startswith("candle") else "line"
+        self.chart_mode = mode
+        if self.popup_charttype_combo:
+            target = "Candlestick" if mode == "candlestick" else "Line"
+            if self.popup_charttype_combo.currentText() != target:
+                self.popup_charttype_combo.setCurrentText(target)
+        if self.chart_popup_widget:
+            self.chart_popup_widget.set_chart_type(mode)
+
+    def place_order_from_popup(self, side):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Connect first.")
+            return
+        if not self.active_token:
+            self.bus.error.emit("No Token", "Select a token from watchlist first.")
+            return
+        row = self.model.row_by_token(self.active_token)
+        symbol = row.get("name") if row else self.ord_symbol.text().strip()
+        order_type = self.popup_ordtype_combo.currentText().strip() if self.popup_ordtype_combo else "MARKET"
+        qty = self.popup_qty_input.text().strip() if self.popup_qty_input else "1"
+        price = self.popup_price_input.text().strip() if self.popup_price_input else "0"
+        try:
+            qty_num = int(float(qty or "0"))
+        except Exception:
+            self.bus.error.emit("Invalid Qty", "Qty must be a positive number.")
+            return
+        if qty_num <= 0:
+            self.bus.error.emit("Invalid Qty", "Qty must be greater than 0.")
+            return
+        if order_type.upper() == "MARKET":
+            price = "0"
+        else:
+            try:
+                price_num = float(price or "0")
+            except Exception:
+                self.bus.error.emit("Invalid Price", "Price must be numeric.")
+                return
+            if price_num <= 0:
+                self.bus.error.emit("Invalid Price", "Limit/IOC orders require price > 0.")
+                return
+
+        self.ord_token.setText(str(self.active_token))
+        self.ord_symbol.setText(str(symbol or ""))
+        self.ord_qty.setText(str(qty_num))
+        self.ord_price.setText(price or "0")
+        self.ord_buysell.setText(side)
+        self.ord_type.setText(order_type)
+        self.place_order()
+
+    def open_login_popup(self):
+        if self.api:
+            self.bus.log.emit("Already connected.")
+            return
+        dialog = LoginDialog(self, defaults=self.login_config)
+        if dialog.exec() != QDialog.Accepted:
+            self.bus.log.emit("Login cancelled.")
+            return
+        self.connect_api(dialog.get_credentials())
+
+    def connect_api(self, credentials):
         def task():
-            self.api = GreekAPI(
-                user=self.username.text().strip(),
-                s_pwd=self.session_pwd.text().strip(),
-                pwd=self.user_pwd.text().strip(),
-                procli=self.procli.text().strip(),
-                ac_no=self.ac_no.text().strip(),
-                is_secure=self.is_secure.isChecked(),
-                is_base_64=self.is_base64.isChecked(),
-                rest_ip=self.rest_ip.text().strip(),
-                rest_port=self.rest_port.text().strip(),
-                iris=self.iris.isChecked(),
-            )
+            try:
+                self.api = GreekAPI(**credentials)
+            except Exception:
+                self.api = None
+                self.bus.session_info.emit("Not logged in")
+                self.bus.login_state.emit(False)
+                self.bus.status.emit("Disconnected")
+                raise
+            self.login_config = dict(credentials)
+            masked_user = credentials.get("user") or "-"
+            account = credentials.get("ac_no") or "-"
             self.bus.status.emit("Connected")
-            self.bus.log.emit("Connected successfully.")
+            self.bus.session_info.emit(f"Logged in: {masked_user} | A/C: {account}")
+            self.bus.login_state.emit(True)
+            self.bus.log.emit("Login successful. Connected to API.")
+            try:
+                df = self.api.get_contract_data()
+                self._build_contract_lookup(df)
+                self.bus.log.emit(f"Contract data loaded: {len(self.token_metadata)} tokens.")
+            except Exception as exc:
+                self.bus.log.emit(f"Contract data load failed: {exc}")
 
+        self.bus.status.emit("Connecting...")
         self._run_bg(task, "Connect")
 
     def disconnect_api(self):
@@ -902,6 +2048,13 @@ class TradingWindow(QMainWindow):
                     self.bus.log.emit(f"Disconnect warning: {exc}")
             self.api = None
             self.bus.clear_watch.emit()
+            self.account_auto_refresh_timer.stop()
+            self.contract_df = None
+            self.contract_lookup.clear()
+            self.token_metadata.clear()
+            self.index_tokens.clear()
+            self.bus.session_info.emit("Not logged in")
+            self.bus.login_state.emit(False)
             self.bus.status.emit("Disconnected")
             self.bus.log.emit("Disconnected.")
 
@@ -912,26 +2065,51 @@ class TradingWindow(QMainWindow):
             self.bus.error.emit("Not Connected", "Connect first.")
             return
 
-        tokens = self._parse_tokens()
+        tokens, unresolved = self._parse_tokens()
         if not tokens:
-            self.bus.error.emit("No Tokens", "Provide token list.")
+            self.bus.error.emit("No Tokens", "Provide valid token/symbol list.")
+            return
+        if unresolved:
+            self.bus.log.emit(f"Unresolved entries skipped: {', '.join(unresolved[:12])}")
+
+        self._start_stream_for_tokens(tokens, source_label="Manual")
+
+    def _start_stream_for_tokens(self, tokens, source_label="Manual"):
+        base_tokens = [str(t) for t in tokens if str(t).strip()]
+        if self.streaming_active and self.stream_thread and self.stream_thread.is_alive() and self.api:
+            incremental = [tok for tok in dict.fromkeys(base_tokens) if tok not in self.current_tokens]
+            if self.primary_index_token not in self.current_tokens:
+                incremental.append(self.primary_index_token)
+            incremental = list(dict.fromkeys(incremental))
+            if incremental:
+                def task_sub():
+                    self.api.subscribe_token(incremental)
+                    self.current_tokens.update([tok for tok in incremental if tok != self.primary_index_token])
+                    self.index_tokens.add(self.primary_index_token)
+                    self.bus.log.emit(f"Stream already active. Added {len(incremental)} token(s).")
+                self._run_bg(task_sub, f"Subscribe Stream {source_label}")
+            else:
+                self.bus.log.emit("Stream already active. No new tokens to add.")
             return
 
         self.streaming_active = True
-        self.current_tokens = set(tokens)
+        self.index_tokens.add(self.primary_index_token)
+        stream_tokens = list(dict.fromkeys(base_tokens))
+        if self.primary_index_token not in stream_tokens:
+            stream_tokens.append(self.primary_index_token)
+            self.bus.log.emit(f"Index token added for WS time: {self.primary_index_token}")
+        self.current_tokens = set(base_tokens)
 
         def task():
             self.api.start_apollo(
-                token_list=tokens,
-                req_data=self.req_data.text().strip() or "ltp",
-                ping_interval=int(self.ping_interval.text().strip() or "20"),
-                ping_timeout=int(self.ping_timeout.text().strip() or "10"),
+                token_list=stream_tokens,
+                req_data="allresp",
             )
             self._start_stream_consumer()
             self.bus.status.emit("Streaming")
-            self.bus.log.emit(f"Streaming started for {len(tokens)} tokens.")
+            self.bus.log.emit(f"Streaming started ({source_label}) for {len(stream_tokens)} tokens (RAW).")
 
-        self._run_bg(task, "Start Stream")
+        self._run_bg(task, f"Start Stream {source_label}")
 
     def _start_stream_consumer(self):
         if self.stream_thread and self.stream_thread.is_alive():
@@ -957,10 +2135,12 @@ class TradingWindow(QMainWindow):
         if not self.api:
             self.bus.error.emit("Not Connected", "Connect first.")
             return
-        tokens = self._parse_tokens()
+        tokens, unresolved = self._parse_tokens()
         if not tokens:
-            self.bus.error.emit("No Tokens", "Provide token list.")
+            self.bus.error.emit("No Tokens", "Provide valid token/symbol list.")
             return
+        if unresolved:
+            self.bus.log.emit(f"Unresolved entries skipped: {', '.join(unresolved[:12])}")
 
         def task():
             self.api.subscribe_token(tokens)
@@ -1014,10 +2194,19 @@ class TradingWindow(QMainWindow):
                 normalized = self._normalize_tick(tick)
                 if not normalized:
                     continue
-                token = normalized[0]
-                if token not in self.current_tokens:
+                token = str(normalized.get("symbol"))
+                if token not in self.current_tokens and token not in self.index_tokens:
                     continue
-                latest[token] = normalized
+                if token in self.index_tokens:
+                    self._update_ws_server_time(normalized.get("ltt"), normalized.get("lut"))
+                if token in self.current_tokens:
+                    latest[token] = normalized
+
+        if not self.ws_server_time_text or self.ws_server_time_text == "-":
+            for value in latest.values():
+                self._update_ws_server_time(value.get("ltt"), value.get("lut"))
+                if self.ws_server_time_text != "-":
+                    break
 
         if not latest:
             return
@@ -1027,7 +2216,12 @@ class TradingWindow(QMainWindow):
         if self.active_token:
             row = self.model.row_by_token(self.active_token)
             if row:
-                self.chart.push_price(self.active_token, row[2])
+                if self.chart_popup_widget:
+                    self.chart_popup_widget.push_price(
+                        self.active_token,
+                        row.get("ltp"),
+                        row.get("lut") or row.get("ltt"),
+                    )
                 self._set_quote_strip(row)
 
         self._perf_counter += 1
@@ -1043,22 +2237,50 @@ class TradingWindow(QMainWindow):
             self.bus.error.emit("Not Connected", "Connect first.")
             return
 
+        def map_side_flag(value):
+            text = str(value or "").strip().upper()
+            if text in ("1", "BUY", "B"):
+                return "1"
+            if text in ("2", "SELL", "S"):
+                return "2"
+            raise ValueError("Invalid Buy/Sell. Use 1/BUY for buy or 2/SELL for sell.")
+
+        def map_ordtype_flag(value):
+            text = str(value or "").strip().upper()
+            if text in ("1", "LIMIT", "LMT"):
+                return "1"
+            if text in ("2", "MARKET", "MKT"):
+                return "2"
+            if text in ("3", "IOC"):
+                return "3"
+            raise ValueError("Invalid Order Type. Use 1/LIMIT, 2/MARKET, or 3/IOC.")
+
         def task():
-            side = side_override if side_override else self.ord_buysell.text().strip()
+            side_flag = map_side_flag(side_override if side_override else self.ord_buysell.text().strip())
+            if side_override:
+                ordtype_flag = "2"
+                price_value = "0"
+            else:
+                ordtype_flag = map_ordtype_flag(self.ord_type.text().strip())
+                price_value = self.ord_price.text().strip()
+                if ordtype_flag == "2":
+                    price_value = "0"
+
             resp = self.api.place_order(
                 tokenno=self.ord_token.text().strip(),
                 symbol=self.ord_symbol.text().strip(),
                 lot=self.ord_lot.text().strip(),
                 qty=self.ord_qty.text().strip(),
-                price=self.ord_price.text().strip(),
-                buysell=side,
-                ordtype=self.ord_type.text().strip(),
+                price=price_value,
+                buysell=side_flag,
+                ordtype=ordtype_flag,
                 trigprice=self.ord_trig.text().strip(),
                 exchange=self.ord_exchange.text().strip(),
                 validity=self.ord_validity.text().strip(),
                 strategyname=self.ord_strategy.text().strip(),
             )
             self.bus.log.emit(f"Place order response: {resp}")
+            self.bus.refresh_orderbook.emit()
 
         self._run_bg(task, "Place Order")
 
@@ -1074,19 +2296,15 @@ class TradingWindow(QMainWindow):
         def task():
             self.api.cancel_order(order_id)
             self.bus.log.emit(f"Cancel order requested for {order_id}")
+            self.bus.refresh_orderbook.emit()
 
         self._run_bg(task, "Cancel Order")
 
     def fetch_server_time(self):
-        if not self.api:
-            self.bus.error.emit("Not Connected", "Connect first.")
+        if self.ws_server_time_text and self.ws_server_time_text != "-":
+            self.bus.log.emit(f"Server time (from WS index tick): {self.ws_server_time_text}")
             return
-
-        def task():
-            server_time = self.api.server_time()
-            self.bus.log.emit(f"Server time: {server_time}")
-
-        self._run_bg(task, "Server Time")
+        self.bus.log.emit("Server time not available yet from websocket. Start stream and wait for index tick.")
 
     def show_perf_stats(self):
         if not self.api:
@@ -1099,42 +2317,53 @@ class TradingWindow(QMainWindow):
 
         self._run_bg(task, "Performance Stats")
 
-    def _fetch_account_view(self, title, fn):
+    def _fetch_account_view(self, title, fn, orderbook_key=None, log_fetch=True):
         if not self.api:
             self.bus.error.emit("Not Connected", "Connect first.")
             return
 
         def task():
-            data = fn()
-            if isinstance(data, (dict, list)):
-                content = json.dumps(data, indent=2, default=str)
-            else:
-                content = str(data)
-            self.bus.account_text.emit(f"{title}\n{'=' * len(title)}\n{content}")
-            self.bus.log.emit(f"{title} fetched.")
+            self._account_refresh_inflight = True
+            try:
+                data = fn()
+                columns, rows = self._rows_from_payload(data)
+                if columns and rows:
+                    self.bus.account_table.emit(title, columns, rows)
+                else:
+                    self.bus.account_table.emit(title, [], [])
+                if orderbook_key:
+                    self.active_orderbook_key = orderbook_key
+                if log_fetch:
+                    self.bus.log.emit(f"{title} fetched.")
+            finally:
+                self._account_refresh_inflight = False
 
         self._run_bg(task, title)
 
-    def fetch_orderbook_all(self):
-        self._fetch_account_view("Orderbook All", lambda: self.api.Orderbook_All())
+    def fetch_orderbook_all(self, log_fetch=True):
+        self._fetch_account_view("Orderbook All", lambda: self.api.Orderbook_All(), orderbook_key="all", log_fetch=log_fetch)
 
-    def fetch_orderbook_traded(self):
-        self._fetch_account_view("Orderbook Traded", lambda: self.api.Orderbook_Traded())
+    def fetch_orderbook_traded(self, log_fetch=True):
+        self._fetch_account_view("Orderbook Traded", lambda: self.api.Orderbook_Traded(), orderbook_key="traded", log_fetch=log_fetch)
 
-    def fetch_orderbook_pending(self):
-        self._fetch_account_view("Orderbook Pending", lambda: self.api.all_pending_order())
+    def fetch_orderbook_rejected(self, log_fetch=True):
+        self._fetch_account_view("Orderbook Rejected", lambda: self.api.Orderbook_Rejected(), orderbook_key="rejected", log_fetch=log_fetch)
 
-    def fetch_positions(self):
-        self._fetch_account_view("Net Positions", lambda: self.api.Net_Position_request())
+    def fetch_orderbook_pending(self, log_fetch=True):
+        self._fetch_account_view("Orderbook Pending", lambda: self.api.all_pending_order(), orderbook_key="pending", log_fetch=log_fetch)
 
-    def fetch_margin(self):
-        self._fetch_account_view("Margin", lambda: self.api.get_margin_details())
+    def fetch_positions(self, log_fetch=True):
+        self._fetch_account_view("Net Positions", lambda: self.api.Net_Position_request(), orderbook_key="positions", log_fetch=log_fetch)
 
-    def fetch_holdings(self):
-        self._fetch_account_view("Holdings", lambda: self.api.get_holding_details())
+    def fetch_margin(self, log_fetch=True):
+        self._fetch_account_view("Margin", lambda: self.api.get_margin_details(), orderbook_key="margin", log_fetch=log_fetch)
+
+    def fetch_holdings(self, log_fetch=True):
+        self._fetch_account_view("Holdings", lambda: self.api.get_holding_details(), orderbook_key="holdings", log_fetch=log_fetch)
 
     def closeEvent(self, event):
         self.streaming_active = False
+        self.account_auto_refresh_timer.stop()
         if self.api:
             try:
                 self.api.close_connection()
