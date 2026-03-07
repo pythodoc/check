@@ -22,6 +22,7 @@ try:
         QGroupBox,
         QHBoxLayout,
         QHeaderView,
+        QInputDialog,
         QLabel,
         QLineEdit,
         QMainWindow,
@@ -140,6 +141,7 @@ class SignalBus(QObject):
     account_text = Signal(str)
     clear_watch = Signal()
     remove_tokens = Signal(list)
+    contract_ready = Signal()
 
 
 class MarketTableModel(QAbstractTableModel):
@@ -383,6 +385,11 @@ class AccountTableModel(QAbstractTableModel):
         self._columns = list(columns)
         self._rows = list(rows)
         self.endResetModel()
+
+    def row_at(self, row_idx):
+        if row_idx < 0 or row_idx >= len(self._rows):
+            return None
+        return self._rows[row_idx]
 
 
 class PriceChartWidget(QWidget):
@@ -945,6 +952,7 @@ class LoginDialog(QDialog):
         self.session_pwd.setEchoMode(QLineEdit.Password)
         self.user_pwd = QLineEdit(cfg.get("pwd", ""))
         self.user_pwd.setEchoMode(QLineEdit.Password)
+        self.user_pwd.setMaxLength(12)
         self.procli = QLineEdit(cfg.get("procli", "0"))
         self.ac_no = QLineEdit(cfg.get("ac_no", ""))
         self.rest_ip = QLineEdit(cfg.get("rest_ip", "127.0.0.1"))
@@ -1003,6 +1011,88 @@ class LoginDialog(QDialog):
         }
 
 
+class QuickOrderDialog(QDialog):
+    def __init__(self, parent=None, side="BUY", token="", symbol="", ltp=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.setWindowTitle(f"Quick {side}")
+        self.resize(420, 280)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.side_label = QLabel(side)
+        self.side_label.setStyleSheet("font-weight: 700; color: #22c55e;" if side.upper() == "BUY" else "font-weight: 700; color: #ef4444;")
+        self.token_input = QLineEdit(str(token or ""))
+        self.symbol_input = QLineEdit(str(symbol or ""))
+        self.qty_input = QLineEdit("1")
+        self.ordtype_combo = QComboBox()
+        self.ordtype_combo.addItems(["MARKET", "LIMIT", "IOC"])
+        self.price_input = QLineEdit("0")
+        if ltp is not None:
+            self.price_input.setText(f"{ltp:.2f}")
+            self.ordtype_combo.setCurrentText("LIMIT")
+        self.trigger_input = QLineEdit("0")
+
+        self.ordtype_combo.currentTextChanged.connect(
+            lambda text: self.price_input.setText("0") if str(text).upper() == "MARKET" else None
+        )
+
+        form.addRow("Side", self.side_label)
+        form.addRow("Token", self.token_input)
+        form.addRow("Symbol", self.symbol_input)
+        form.addRow("Qty", self.qty_input)
+        form.addRow("Order Type", self.ordtype_combo)
+        form.addRow("Price", self.price_input)
+        form.addRow("Trigger", self.trigger_input)
+        layout.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Place Order")
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _validate_and_accept(self):
+        token = self.token_input.text().strip()
+        qty = self.qty_input.text().strip()
+        price = self.price_input.text().strip()
+        ordtype = self.ordtype_combo.currentText().strip().upper()
+
+        if not token:
+            QMessageBox.warning(self, "Missing Token", "Token is required.")
+            return
+        try:
+            qty_num = int(float(qty or "0"))
+        except Exception:
+            QMessageBox.warning(self, "Invalid Qty", "Qty must be numeric.")
+            return
+        if qty_num <= 0:
+            QMessageBox.warning(self, "Invalid Qty", "Qty must be greater than 0.")
+            return
+        if ordtype != "MARKET":
+            try:
+                price_num = float(price or "0")
+            except Exception:
+                QMessageBox.warning(self, "Invalid Price", "Price must be numeric.")
+                return
+            if price_num <= 0:
+                QMessageBox.warning(self, "Invalid Price", "Limit/IOC require price > 0.")
+                return
+        self.accept()
+
+    def payload(self):
+        ordtype = self.ordtype_combo.currentText().strip().upper()
+        return {
+            "token": self.token_input.text().strip(),
+            "symbol": self.symbol_input.text().strip(),
+            "qty": self.qty_input.text().strip() or "1",
+            "ordtype": ordtype,
+            "price": "0" if ordtype == "MARKET" else (self.price_input.text().strip() or "0"),
+            "trigger": self.trigger_input.text().strip() or "0",
+        }
+
+
 class TradingWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1021,6 +1111,7 @@ class TradingWindow(QMainWindow):
         self.bus.account_text.connect(self.account_output_set_text)
         self.bus.clear_watch.connect(self._clear_watch_ui)
         self.bus.remove_tokens.connect(self.model_remove_tokens)
+        self.bus.contract_ready.connect(self._refresh_contract_filters)
 
         self.model = MarketTableModel()
         self.account_model = AccountTableModel()
@@ -1034,7 +1125,9 @@ class TradingWindow(QMainWindow):
         self.active_token = None
         self._perf_counter = 0
         self.contract_df = None
+        self.contract_colmap = {}
         self.contract_lookup = {}
+        self.contract_cache = {}
         self.token_metadata = {}
         self.primary_index_token = "101999957"
         self.index_tokens = {self.primary_index_token}
@@ -1048,6 +1141,10 @@ class TradingWindow(QMainWindow):
         self.popup_price_input = None
         self.popup_token_label = None
         self._watchlist_delete_shortcut = None
+        self._watchlist_buy_shortcut = None
+        self._watchlist_sell_shortcut = None
+        self._contract_enter_shortcut = None
+        self._contract_num_enter_shortcut = None
         self.login_config = {
             "user": "",
             "s_pwd": "",
@@ -1069,6 +1166,8 @@ class TradingWindow(QMainWindow):
         self.account_auto_refresh_timer.setInterval(4000)
         self.account_auto_refresh_timer.timeout.connect(lambda: self.refresh_active_orderbook(auto=True))
         self._account_refresh_inflight = False
+        self._pending_cancel_shortcut = None
+        self._pending_modify_shortcut = None
 
         self._build_ui()
         self._set_logged_in_state(False)
@@ -1098,10 +1197,8 @@ class TradingWindow(QMainWindow):
         self.upper_splitter.setHandleWidth(8)
 
         self.upper_splitter.addWidget(self._build_watchlist_panel())
-        self.upper_splitter.addWidget(self._build_trade_panel())
-        self.upper_splitter.setStretchFactor(0, 7)
-        self.upper_splitter.setStretchFactor(1, 4)
-        self.upper_splitter.setSizes([980, 520])
+        self.upper_splitter.setStretchFactor(0, 1)
+        self.upper_splitter.setSizes([1500])
 
         self.vertical_splitter.addWidget(self.upper_splitter)
         self.vertical_splitter.addWidget(self._build_bottom_console())
@@ -1274,38 +1371,51 @@ class TradingWindow(QMainWindow):
         self.watchlist_panel = panel
         layout = QVBoxLayout(panel)
 
-        self.token_input = QPlainTextEdit()
-        self.token_input.setPlaceholderText("Enter token or EXCHANGE:SYMBOL separated by comma/newline")
-        self.token_input.setFixedHeight(90)
-        layout.addWidget(self.token_input)
+        self.contract_filter_box = QGroupBox("Contract Filter (Press Enter to Add)")
+        filter_layout = QVBoxLayout(self.contract_filter_box)
+        primary_row = QHBoxLayout()
+        primary_row.addWidget(QLabel("Exchange Segment"))
+        self.contract_exchange_combo = QComboBox()
+        self.contract_exchange_combo.currentTextChanged.connect(self._on_contract_exchange_changed)
+        primary_row.addWidget(self.contract_exchange_combo, 1)
+        primary_row.addWidget(QLabel("Symbol"))
+        self.contract_symbol_combo = QComboBox()
+        self.contract_symbol_combo.setEditable(True)
+        self.contract_symbol_combo.currentTextChanged.connect(self._on_contract_symbol_changed)
+        primary_row.addWidget(self.contract_symbol_combo, 1)
+        filter_layout.addLayout(primary_row)
 
-        resolve_row = QHBoxLayout()
-        resolve_row.addWidget(QLabel("Exchange"))
-        self.exchange_input = QComboBox()
-        self.exchange_input.addItems(["NSE", "BSE", "MCX"])
-        resolve_row.addWidget(self.exchange_input)
-        self.btn_refresh_contracts = QPushButton("Refresh Contracts")
-        self.btn_refresh_contracts.clicked.connect(self.refresh_contract_data)
-        resolve_row.addWidget(self.btn_refresh_contracts)
-        resolve_row.addStretch(1)
-        layout.addLayout(resolve_row)
+        self.contract_derivative_row = QWidget()
+        der_row = QHBoxLayout(self.contract_derivative_row)
+        der_row.setContentsMargins(0, 0, 0, 0)
+        der_row.addWidget(QLabel("Series/InstType"))
+        self.contract_inst_combo = QComboBox()
+        self.contract_inst_combo.currentTextChanged.connect(self._on_contract_inst_changed)
+        der_row.addWidget(self.contract_inst_combo, 1)
+        der_row.addWidget(QLabel("Expiry"))
+        self.contract_expiry_combo = QComboBox()
+        self.contract_expiry_combo.currentTextChanged.connect(self._on_contract_expiry_changed)
+        der_row.addWidget(self.contract_expiry_combo, 1)
+        der_row.addWidget(QLabel("Strike"))
+        self.contract_strike_combo = QComboBox()
+        self.contract_strike_combo.currentTextChanged.connect(self._on_contract_strike_changed)
+        der_row.addWidget(self.contract_strike_combo, 1)
+        der_row.addWidget(QLabel("Option Type"))
+        self.contract_option_combo = QComboBox()
+        der_row.addWidget(self.contract_option_combo, 1)
+        filter_layout.addWidget(self.contract_derivative_row)
 
-        controls = QHBoxLayout()
-        self.btn_start_stream = QPushButton("Start Stream")
-        self.btn_start_stream.setObjectName("primary")
-        self.btn_start_stream.clicked.connect(self.start_stream)
-        self.btn_subscribe = QPushButton("Subscribe")
-        self.btn_subscribe.clicked.connect(self.subscribe_tokens)
-        self.btn_unsubscribe = QPushButton("Unsubscribe Selected")
-        self.btn_unsubscribe.clicked.connect(self.unsubscribe_selected)
-        self.btn_clear = QPushButton("Clear")
-        self.btn_clear.clicked.connect(self.clear_watch)
+        self.contract_filter_hint = QLabel("Select filter values and press Enter to subscribe GreekToken and add it to watchlist.")
+        self.contract_filter_hint.setStyleSheet("color: #93c5fd;")
+        self.contract_filter_hint.setWordWrap(True)
+        filter_layout.addWidget(self.contract_filter_hint)
 
-        controls.addWidget(self.btn_start_stream)
-        controls.addWidget(self.btn_subscribe)
-        controls.addWidget(self.btn_unsubscribe)
-        controls.addWidget(self.btn_clear)
-        layout.addLayout(controls)
+        layout.addWidget(self.contract_filter_box)
+        self.contract_derivative_row.setVisible(False)
+        self._contract_enter_shortcut = QShortcut(QKeySequence("Return"), self.contract_filter_box)
+        self._contract_enter_shortcut.activated.connect(self._on_contract_enter_pressed)
+        self._contract_num_enter_shortcut = QShortcut(QKeySequence("Enter"), self.contract_filter_box)
+        self._contract_num_enter_shortcut.activated.connect(self._on_contract_enter_pressed)
 
         self.table = QTableView()
         self.table.setModel(self.model)
@@ -1317,88 +1427,17 @@ class TradingWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.clicked.connect(self._on_table_clicked)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_right_click)
         self._watchlist_delete_shortcut = QShortcut(QKeySequence("Del"), self.table)
         self._watchlist_delete_shortcut.activated.connect(self.unsubscribe_selected)
+        self._watchlist_buy_shortcut = QShortcut(QKeySequence("+"), self.table)
+        self._watchlist_buy_shortcut.activated.connect(lambda: self.open_quick_order_for_selection("BUY"))
+        self._watchlist_sell_shortcut = QShortcut(QKeySequence("-"), self.table)
+        self._watchlist_sell_shortcut.activated.connect(lambda: self.open_quick_order_for_selection("SELL"))
         layout.addWidget(self.table, 1)
 
         return panel
-
-    def _build_trade_panel(self):
-        container = QWidget()
-        container.setMinimumWidth(360)
-        col = QVBoxLayout(container)
-        col.setContentsMargins(0, 0, 0, 0)
-
-        conn = QGroupBox("Connection")
-        form = QFormLayout(conn)
-
-        self.session_info_label = QLabel("Not logged in")
-        self.session_info_label.setStyleSheet("font-weight: 700; color: #fca5a5;")
-        form.addRow("Session", self.session_info_label)
-
-        self.req_mode_label = QLabel("RAW (allresp)")
-        self.req_mode_label.setStyleSheet("font-weight: 700; color: #93c5fd;")
-        form.addRow("Req Data", self.req_mode_label)
-
-        col.addWidget(conn)
-
-        ticket = QGroupBox("Order Ticket")
-        self.ticket_group = ticket
-        order_form = QFormLayout(ticket)
-
-        self.ord_token = QLineEdit()
-        self.ord_symbol = QLineEdit()
-        self.ord_lot = QLineEdit("1")
-        self.ord_qty = QLineEdit("1")
-        self.ord_price = QLineEdit("0")
-        self.ord_buysell = QLineEdit("BUY")
-        self.ord_type = QLineEdit("LIMIT")
-        self.ord_buysell.setPlaceholderText("1/BUY or 2/SELL")
-        self.ord_type.setPlaceholderText("1/LIMIT, 2/MARKET, 3/IOC")
-        self.ord_trig = QLineEdit("0")
-        self.ord_exchange = QLineEdit("NSE")
-        self.ord_validity = QLineEdit("0")
-        self.ord_strategy = QLineEdit("GreekViewPro")
-        self.cancel_order_id = QLineEdit()
-
-        order_form.addRow("Token", self.ord_token)
-        order_form.addRow("Symbol", self.ord_symbol)
-        order_form.addRow("Lot", self.ord_lot)
-        order_form.addRow("Qty", self.ord_qty)
-        order_form.addRow("Price", self.ord_price)
-        order_form.addRow("Buy/Sell", self.ord_buysell)
-        order_form.addRow("Order Type", self.ord_type)
-        order_form.addRow("Trigger", self.ord_trig)
-        order_form.addRow("Exchange", self.ord_exchange)
-        order_form.addRow("Validity", self.ord_validity)
-        order_form.addRow("Strategy", self.ord_strategy)
-
-        action_row = QHBoxLayout()
-        buy_btn = QPushButton("Quick BUY")
-        buy_btn.setObjectName("buy")
-        buy_btn.clicked.connect(lambda: self.place_order(side_override="BUY"))
-        sell_btn = QPushButton("Quick SELL")
-        sell_btn.setObjectName("sell")
-        sell_btn.clicked.connect(lambda: self.place_order(side_override="SELL"))
-        action_row.addWidget(buy_btn)
-        action_row.addWidget(sell_btn)
-        order_form.addRow(action_row)
-
-        place_row = QHBoxLayout()
-        place_btn = QPushButton("Place Order")
-        place_btn.setObjectName("primary")
-        place_btn.clicked.connect(self.place_order)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.cancel_order)
-        self.cancel_order_id.setPlaceholderText("Order ID")
-        place_row.addWidget(place_btn)
-        place_row.addWidget(cancel_btn)
-        order_form.addRow("Cancel ID", self.cancel_order_id)
-        order_form.addRow(place_row)
-
-        col.addWidget(ticket)
-        col.addStretch(1)
-        return container
 
     def _build_bottom_console(self):
         tabs = QTabWidget()
@@ -1433,17 +1472,21 @@ class TradingWindow(QMainWindow):
         self.status_label.setText(status)
 
     def _set_session_info(self, text):
-        self.session_info_label.setText(text)
-        if text.lower().startswith("logged in"):
-            self.session_info_label.setStyleSheet("font-weight: 700; color: #86efac;")
-        else:
-            self.session_info_label.setStyleSheet("font-weight: 700; color: #fca5a5;")
+        if hasattr(self, "session_info_label") and self.session_info_label:
+            self.session_info_label.setText(text)
+            if text.lower().startswith("logged in"):
+                self.session_info_label.setStyleSheet("font-weight: 700; color: #86efac;")
+            else:
+                self.session_info_label.setStyleSheet("font-weight: 700; color: #fca5a5;")
 
     def _set_logged_in_state(self, enabled):
         self.watchlist_panel.setEnabled(enabled)
-        self.ticket_group.setEnabled(enabled)
+        if hasattr(self, "contract_filter_box"):
+            self.contract_filter_box.setEnabled(enabled)
         if not enabled:
             self.account_model.clear()
+            if hasattr(self, "contract_exchange_combo"):
+                self._refresh_contract_filters()
 
     def _clear_watch_ui(self):
         self.model.clear()
@@ -1482,6 +1525,10 @@ class TradingWindow(QMainWindow):
             self.account_popup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
             self.account_popup_table.horizontalHeader().setStretchLastSection(True)
             layout.addWidget(self.account_popup_table, 1)
+            self._pending_cancel_shortcut = QShortcut(QKeySequence("Del"), self.account_popup_table)
+            self._pending_cancel_shortcut.activated.connect(self._cancel_selected_pending_order)
+            self._pending_modify_shortcut = QShortcut(QKeySequence("M"), self.account_popup_table)
+            self._pending_modify_shortcut.activated.connect(self._modify_selected_pending_order)
         self.account_popup.setWindowTitle(title)
         self.account_popup.show()
         self.account_popup.raise_()
@@ -1493,6 +1540,156 @@ class TradingWindow(QMainWindow):
         self.account_model.set_records(columns, rows)
         self._ensure_account_popup(title)
         self.bus.log.emit(f"{title} table updated: {len(rows)} row(s).")
+
+    @staticmethod
+    def _pick_from_row(row, candidates):
+        if not isinstance(row, dict):
+            return None
+        if not row:
+            return None
+        lowered = {str(k).strip().lower(): k for k in row.keys()}
+        for candidate in candidates:
+            key = lowered.get(str(candidate).strip().lower())
+            if key is not None:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    def _selected_account_row(self):
+        if not self.account_popup_table:
+            return None
+        model = self.account_popup_table.selectionModel()
+        if not model:
+            return None
+        indexes = model.selectedRows()
+        if not indexes:
+            return None
+        return self.account_model.row_at(indexes[0].row())
+
+    def _resolve_pending_order_context(self, row):
+        if not row:
+            return None
+        gorderid = self._pick_from_row(row, ("gorderid", "greekorderno", "orderid", "order_no", "orderno"))
+        if not gorderid:
+            return None
+        qty = self._pick_from_row(row, ("qty", "quantity", "remainingqty", "remaining_qty")) or "1"
+        lot = self._pick_from_row(row, ("lot", "lotsize", "lot_size")) or "1"
+        ordtype = self._pick_from_row(row, ("order_type", "ordtype", "type", "ordertype")) or "1"
+        token = self._pick_from_row(row, ("gtoken", "greektoken", "token", "tokenno", "symboltoken"))
+        asset_type = self._pick_from_row(row, ("asset_type", "assettype", "series/insttype", "series"))
+        ltp = self._pick_from_row(row, ("ltp", "last_price", "lastprice", "price"))
+        return {
+            "gorderid": str(gorderid).strip(),
+            "qty": str(qty).strip() or "1",
+            "lot": str(lot).strip() or "1",
+            "ordtype": str(ordtype).strip() or "1",
+            "token": str(token).strip() if token not in (None, "") else "",
+            "asset_type": str(asset_type).strip() if asset_type not in (None, "") else "",
+            "ltp": ltp,
+        }
+
+    def _latest_price_for_pending(self, ctx):
+        token = str(ctx.get("token") or "").strip()
+        if token:
+            watch_row = self.model.row_by_token(token)
+            if watch_row:
+                live_ltp = _to_float(watch_row.get("ltp"))
+                if live_ltp is not None and live_ltp > 0:
+                    return live_ltp
+        ltp = _to_float(ctx.get("ltp"))
+        if ltp is not None and ltp > 0:
+            return ltp
+        if self.api and token:
+            try:
+                quote = self.api.token_broadcast(token, ctx.get("asset_type") or "")
+                q_ltp = _to_float((quote or {}).get("ltp"))
+                if q_ltp is not None and q_ltp > 0:
+                    return q_ltp
+            except Exception:
+                pass
+        return None
+
+    def _cancel_selected_pending_order(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+        if (self.active_orderbook_key or "").lower() != "pending":
+            self.bus.error.emit("Pending Only", "Open Pending Orderbook and select an order first.")
+            return
+        row = self._selected_account_row()
+        ctx = self._resolve_pending_order_context(row)
+        if not ctx or not ctx.get("gorderid"):
+            self.bus.error.emit("No Order", "Selected row does not have gorderid.")
+            return
+        gorderid = ctx["gorderid"]
+        ask = QMessageBox.question(
+            self,
+            "Cancel Pending Order",
+            f"Cancel pending order {gorderid}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ask != QMessageBox.Yes:
+            return
+
+        def task():
+            self.api.cancel_order(gorderid)
+            self.bus.log.emit(f"Cancel requested for gorderid {gorderid}.")
+            self.fetch_orderbook_pending(log_fetch=False)
+
+        self._run_bg(task, "Cancel Pending Order")
+
+    def _modify_selected_pending_order(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+        if (self.active_orderbook_key or "").lower() != "pending":
+            self.bus.error.emit("Pending Only", "Open Pending Orderbook and select an order first.")
+            return
+        row = self._selected_account_row()
+        ctx = self._resolve_pending_order_context(row)
+        if not ctx or not ctx.get("gorderid"):
+            self.bus.error.emit("No Order", "Selected row does not have gorderid.")
+            return
+
+        latest_price = self._latest_price_for_pending(ctx)
+        if latest_price is None:
+            self.bus.error.emit("No Price", "Latest price not available for selected order.")
+            return
+
+        try:
+            ordtype_flag = self._map_ordtype_flag(ctx.get("ordtype"))
+        except Exception:
+            ordtype_flag = "1"
+        if ordtype_flag == "2":
+            ordtype_flag = "1"
+
+        gorderid = ctx["gorderid"]
+        qty = ctx.get("qty") or "1"
+        lot = ctx.get("lot") or "1"
+        ask = QMessageBox.question(
+            self,
+            "Modify Pending Order",
+            f"Modify order {gorderid} to latest price {latest_price:.2f}?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if ask != QMessageBox.Yes:
+            return
+
+        def task():
+            resp = self.api.modify_order(
+                price=f"{latest_price:.2f}",
+                lot=str(lot),
+                qty=str(qty),
+                ordtype=str(ordtype_flag),
+                gorderid=str(gorderid),
+            )
+            self.bus.log.emit(f"Modify requested for gorderid {gorderid}: {resp}")
+            self.fetch_orderbook_pending(log_fetch=False)
+
+        self._run_bg(task, "Modify Pending Order")
 
     @staticmethod
     def _rows_from_payload(data):
@@ -1703,7 +1900,9 @@ class TradingWindow(QMainWindow):
 
     def _build_contract_lookup(self, df):
         self.contract_df = df
+        self.contract_colmap = {}
         self.contract_lookup.clear()
+        self.contract_cache = {}
         self.token_metadata.clear()
         self.index_tokens.clear()
         self.index_tokens.add(self.primary_index_token)
@@ -1711,14 +1910,45 @@ class TradingWindow(QMainWindow):
             return
 
         token_col = self._pick_column(df.columns, ("gtoken", "token", "symboltoken", "tokenno"))
+        if token_col is None:
+            token_col = self._pick_column(df.columns, ("greektoken",))
         symbol_col = self._pick_column(df.columns, ("tradingsymbol", "symbol", "tsym", "name", "sname"))
         exchange_col = self._pick_column(df.columns, ("exchange", "exch", "exch_seg", "exchange_segment"))
+        if exchange_col is None:
+            exchange_col = self._pick_column(df.columns, ("exchangesegment",))
         name_col = self._pick_column(df.columns, ("name", "companyname", "description", "symbol", "tradingsymbol"))
         asset_col = self._pick_column(df.columns, ("assettype", "asset_type", "instrumenttype", "segment", "series"))
+        inst_col = self._pick_column(df.columns, ("series/insttype", "series", "insttype", "instrumenttype"))
+        expiry_col = self._pick_column(df.columns, ("expirydate", "expiry", "expdate"))
+        strike_col = self._pick_column(df.columns, ("strikeprice", "strike", "strike_price"))
+        option_col = self._pick_column(df.columns, ("optiontype", "opttype", "option_type"))
+
+        self.contract_colmap = {
+            "token": token_col,
+            "exchange": exchange_col,
+            "symbol": symbol_col,
+            "name": name_col,
+            "asset": asset_col,
+            "inst": inst_col,
+            "expiry": expiry_col,
+            "strike": strike_col,
+            "option": option_col,
+        }
 
         if token_col is None:
             self.bus.log.emit("Contract data loaded but token column not found.")
             return
+
+        cache = {
+            "exchanges": set(),
+            "exchange_to_symbols": {},
+            "fo_exsym_to_inst": {},
+            "fo_exsyminst_to_expiry": {},
+            "fo_exsyminstexp_to_strike": {},
+            "fo_exsyminstexpstrike_to_option": {},
+            "eq_row_by_exsym": {},
+            "fo_row_by_fullkey": {},
+        }
 
         for _, row in df.iterrows():
             token = str(row.get(token_col, "")).strip()
@@ -1728,6 +1958,11 @@ class TradingWindow(QMainWindow):
             symbol = str(row.get(symbol_col, "")).strip().upper() if symbol_col else ""
             name = str(row.get(name_col, "")).strip() if name_col else symbol
             asset_type = str(row.get(asset_col, "")).strip().upper() if asset_col else ""
+            inst = str(row.get(inst_col, "")).strip().upper() if inst_col else ""
+            expiry = self._to_text(row.get(expiry_col)) if expiry_col else ""
+            strike = self._to_text(row.get(strike_col)) if strike_col else ""
+            option = self._to_text(row.get(option_col)).upper() if option_col else ""
+
             if symbol:
                 key = f"{exchange}:{symbol}" if exchange else symbol
                 self.contract_lookup[key] = token
@@ -1738,6 +1973,253 @@ class TradingWindow(QMainWindow):
             if ("INDEX" in meta_text) or any(idx in meta_text for idx in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY")):
                 self.index_tokens.add(token)
 
+            if exchange:
+                cache["exchanges"].add(exchange)
+            if exchange and symbol:
+                cache["exchange_to_symbols"].setdefault(exchange, set()).add(symbol)
+
+            row_data = {
+                "token": token,
+                "exchange": exchange,
+                "symbol": symbol,
+                "name": name or symbol,
+                "inst": inst,
+                "expiry": expiry,
+                "strike": strike,
+                "option": option,
+                "asset_type": asset_type,
+            }
+            exsym = (exchange, symbol)
+            if self._is_fo_segment(exchange):
+                if inst:
+                    cache["fo_exsym_to_inst"].setdefault(exsym, set()).add(inst)
+                    exsyminst = (exchange, symbol, inst)
+                    if expiry:
+                        cache["fo_exsyminst_to_expiry"].setdefault(exsyminst, set()).add(expiry)
+                        exsyminstexp = (exchange, symbol, inst, expiry)
+                        if strike:
+                            cache["fo_exsyminstexp_to_strike"].setdefault(exsyminstexp, set()).add(strike)
+                            exsyminstexpstrike = (exchange, symbol, inst, expiry, strike)
+                            if option:
+                                cache["fo_exsyminstexpstrike_to_option"].setdefault(exsyminstexpstrike, set()).add(option)
+                                full_key = (exchange, symbol, inst, expiry, strike, option)
+                                cache["fo_row_by_fullkey"][full_key] = row_data
+            else:
+                if exsym not in cache["eq_row_by_exsym"]:
+                    cache["eq_row_by_exsym"][exsym] = row_data
+
+        for key in (
+            "exchange_to_symbols",
+            "fo_exsym_to_inst",
+            "fo_exsyminst_to_expiry",
+            "fo_exsyminstexp_to_strike",
+            "fo_exsyminstexpstrike_to_option",
+        ):
+            cache[key] = {k: self._sort_mixed(v) for k, v in cache[key].items()}
+        cache["exchanges"] = sorted(cache["exchanges"])
+        self.contract_cache = cache
+
+    @staticmethod
+    def _combo_fill(combo, values):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("")
+        for value in values:
+            combo.addItem(str(value))
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    @staticmethod
+    def _to_text(value):
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() == "nan" else text
+
+    @staticmethod
+    def _is_fo_segment(exchange_segment):
+        text = str(exchange_segment or "").upper()
+        return text.endswith("FO") or "FO" in text
+
+    @staticmethod
+    def _sort_mixed(values):
+        def key_fn(item):
+            text = str(item)
+            try:
+                return (0, float(text))
+            except Exception:
+                return (1, text)
+
+        return sorted(values, key=key_fn)
+
+    def _filtered_contract_df(self, exchange=None, symbol=None, inst=None, expiry=None, strike=None, option=None):
+        df = self.contract_df
+        if df is None or getattr(df, "empty", True):
+            return None
+        col = self.contract_colmap
+
+        def apply_filter(frame, col_key, value):
+            column = col.get(col_key)
+            if not column or value in (None, ""):
+                return frame
+            return frame[frame[column].astype(str).str.strip().str.upper() == str(value).strip().upper()]
+
+        out = df
+        out = apply_filter(out, "exchange", exchange)
+        out = apply_filter(out, "symbol", symbol)
+        out = apply_filter(out, "inst", inst)
+        out = apply_filter(out, "expiry", expiry)
+        out = apply_filter(out, "strike", strike)
+        out = apply_filter(out, "option", option)
+        return out
+
+    def _refresh_contract_filters(self):
+        if not hasattr(self, "contract_exchange_combo"):
+            return
+        cache = self.contract_cache or {}
+        if not cache:
+            self._combo_fill(self.contract_exchange_combo, [])
+            self._combo_fill(self.contract_symbol_combo, [])
+            self._combo_fill(self.contract_inst_combo, [])
+            self._combo_fill(self.contract_expiry_combo, [])
+            self._combo_fill(self.contract_strike_combo, [])
+            self._combo_fill(self.contract_option_combo, [])
+            self.contract_derivative_row.setVisible(False)
+            return
+
+        exchanges = cache.get("exchanges", [])
+        self._combo_fill(self.contract_exchange_combo, exchanges)
+        self._combo_fill(self.contract_symbol_combo, [])
+        self._combo_fill(self.contract_inst_combo, [])
+        self._combo_fill(self.contract_expiry_combo, [])
+        self._combo_fill(self.contract_strike_combo, [])
+        self._combo_fill(self.contract_option_combo, [])
+        self.contract_derivative_row.setVisible(False)
+
+    def _on_contract_exchange_changed(self, value):
+        exchange = str(value).strip().upper()
+        symbols = []
+        if exchange:
+            symbols = self.contract_cache.get("exchange_to_symbols", {}).get((exchange), [])
+        self._combo_fill(self.contract_symbol_combo, symbols)
+        self._combo_fill(self.contract_inst_combo, [])
+        self._combo_fill(self.contract_expiry_combo, [])
+        self._combo_fill(self.contract_strike_combo, [])
+        self._combo_fill(self.contract_option_combo, [])
+        self.contract_derivative_row.setVisible(self._is_fo_segment(exchange))
+
+    def _on_contract_symbol_changed(self, value):
+        exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
+        symbol = self._to_text(value).upper()
+        if not self._is_fo_segment(exchange):
+            return
+        inst_values = []
+        if symbol:
+            inst_values = self.contract_cache.get("fo_exsym_to_inst", {}).get((exchange, symbol), [])
+        self._combo_fill(self.contract_inst_combo, inst_values)
+        self._combo_fill(self.contract_expiry_combo, [])
+        self._combo_fill(self.contract_strike_combo, [])
+        self._combo_fill(self.contract_option_combo, [])
+
+    def _on_contract_inst_changed(self, value):
+        exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
+        symbol = self._to_text(self.contract_symbol_combo.currentText()).upper()
+        inst = self._to_text(value).upper()
+        expiry_values = []
+        if inst:
+            expiry_values = self.contract_cache.get("fo_exsyminst_to_expiry", {}).get((exchange, symbol, inst), [])
+        self._combo_fill(self.contract_expiry_combo, expiry_values)
+        self._combo_fill(self.contract_strike_combo, [])
+        self._combo_fill(self.contract_option_combo, [])
+
+    def _on_contract_expiry_changed(self, value):
+        exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
+        symbol = self._to_text(self.contract_symbol_combo.currentText()).upper()
+        inst = self._to_text(self.contract_inst_combo.currentText()).upper()
+        expiry = self._to_text(value)
+        strikes = []
+        if expiry:
+            strikes = self.contract_cache.get("fo_exsyminstexp_to_strike", {}).get((exchange, symbol, inst, expiry), [])
+        self._combo_fill(self.contract_strike_combo, strikes)
+        self._combo_fill(self.contract_option_combo, [])
+
+    def _on_contract_strike_changed(self, value):
+        exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
+        symbol = self._to_text(self.contract_symbol_combo.currentText()).upper()
+        inst = self._to_text(self.contract_inst_combo.currentText()).upper()
+        expiry = self._to_text(self.contract_expiry_combo.currentText())
+        strike = self._to_text(value)
+        options = []
+        if strike:
+            key = (exchange, symbol, inst, expiry, strike)
+            options = self.contract_cache.get("fo_exsyminstexpstrike_to_option", {}).get(key, [])
+        self._combo_fill(self.contract_option_combo, options)
+
+    def _on_contract_enter_pressed(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+        exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
+        symbol = self._to_text(self.contract_symbol_combo.currentText()).upper()
+        if not exchange or not symbol:
+            self.bus.error.emit("Incomplete Filter", "Select Exchange Segment and Symbol.")
+            return
+
+        if self._is_fo_segment(exchange):
+            inst = self._to_text(self.contract_inst_combo.currentText()).upper()
+            expiry = self._to_text(self.contract_expiry_combo.currentText())
+            strike = self._to_text(self.contract_strike_combo.currentText())
+            option = self._to_text(self.contract_option_combo.currentText()).upper()
+            if not (inst and expiry and strike and option):
+                self.bus.error.emit(
+                    "Incomplete Filter",
+                    "For FO, select Series/InstType, Expiry, Strike and Option Type before Enter.",
+                )
+                return
+            row = self.contract_cache.get("fo_row_by_fullkey", {}).get((exchange, symbol, inst, expiry, strike, option))
+        else:
+            row = self.contract_cache.get("eq_row_by_exsym", {}).get((exchange, symbol))
+        if not row:
+            self.bus.error.emit("Not Found", "No contract matched selected filters.")
+            return
+        token = self._to_text(row.get("token"))
+        if not token:
+            self.bus.error.emit("Contract Error", "Selected contract has empty GreekToken.")
+            return
+
+        self._subscribe_from_contract_row(token, row)
+
+    def _subscribe_from_contract_row(self, token, row):
+        token = str(token).strip()
+        if not token:
+            return
+        exchange = self._to_text(row.get("exchange"))
+        symbol = self._to_text(row.get("symbol"))
+        name = self._to_text(row.get("name")) or symbol
+        inst = self._to_text(row.get("inst"))
+        expiry = self._to_text(row.get("expiry"))
+        strike = self._to_text(row.get("strike"))
+        option = self._to_text(row.get("option"))
+
+        preview_name = " ".join(part for part in (name, inst, expiry, strike, option) if part).strip()
+        self.model.upsert_many(
+            {
+                token: {
+                    "symbol": token,
+                    "name": preview_name or name or symbol,
+                    "exch": exchange,
+                    "asset_type": inst,
+                }
+            }
+        )
+        self._start_stream_for_tokens([token], source_label="ContractFilter")
+        row_idx = self.model.find_row_by_token(token)
+        if row_idx is not None:
+            self.table.selectRow(row_idx)
+            self.table.scrollTo(self.model.index(row_idx, 0))
+            self._activate_token(token, open_chart=False)
+        self.bus.log.emit(f"Subscribed token {token} from contract filter.")
+
     def refresh_contract_data(self):
         if not self.api:
             self.bus.error.emit("Not Connected", "Connect first.")
@@ -1746,6 +2228,7 @@ class TradingWindow(QMainWindow):
         def task():
             df = self.api.get_contract_data()
             self._build_contract_lookup(df)
+            self.bus.contract_ready.emit()
             self.bus.log.emit(f"Contract data loaded: {len(self.token_metadata)} tokens.")
 
         self._run_bg(task, "Contract Data")
@@ -1753,7 +2236,7 @@ class TradingWindow(QMainWindow):
     def _resolve_tokens(self, entries):
         resolved = []
         unresolved = []
-        default_exchange = self.exchange_input.currentText().strip().upper() or "NSE"
+        default_exchange = "NSE"
 
         for raw in entries:
             item = str(raw).strip()
@@ -1785,6 +2268,8 @@ class TradingWindow(QMainWindow):
         return meta.get("name", "")
 
     def _parse_tokens(self):
+        if not hasattr(self, "token_input"):
+            return [], []
         raw = self.token_input.toPlainText().strip()
         if not raw:
             return [], []
@@ -1918,19 +2403,31 @@ class TradingWindow(QMainWindow):
             return
         token = self.model.token_at_row(index.row())
         if token:
-            self._activate_token(token)
+            with_chart = bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
+            self._activate_token(token, open_chart=with_chart)
 
-    def _activate_token(self, token):
+    def _on_table_right_click(self, pos):
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        self.table.selectRow(index.row())
+        token = self.model.token_at_row(index.row())
+        if not token:
+            return
+        self._activate_token(token, open_chart=True)
+
+    def _activate_token(self, token, open_chart=False):
         token = str(token)
         self.active_token = token
         self.focus_token_input.setText(token)
-        self._ensure_chart_popup()
-        self.chart_popup_widget.set_active_token(token)
         row = self.model.row_by_token(token)
         self._set_quote_strip(row)
+        if open_chart:
+            self.open_chart_popup_and_start_broadcast()
+        elif self.chart_popup and self.chart_popup.isVisible() and self.chart_popup_widget:
+            self.chart_popup_widget.set_active_token(token)
+            self._fetch_ohlc_for_token(token)
         if row:
-            self.ord_token.setText(str(row.get("symbol", "")))
-            self.ord_symbol.setText(str(row.get("name", "") or ""))
             if self.popup_token_label:
                 self.popup_token_label.setText(f"Token: {row.get('symbol')} | {row.get('name') or '-'}")
             if self.popup_price_input:
@@ -1939,7 +2436,6 @@ class TradingWindow(QMainWindow):
                     self.popup_price_input.setText(f"{ltp:.2f}")
         elif self.popup_token_label:
             self.popup_token_label.setText(f"Token: {token}")
-        self._fetch_ohlc_for_token(token)
 
     def set_timeframe(self, tf):
         self.active_timeframe = tf
@@ -1968,7 +2464,7 @@ class TradingWindow(QMainWindow):
             self.bus.error.emit("No Token", "Select a token from watchlist first.")
             return
         row = self.model.row_by_token(self.active_token)
-        symbol = row.get("name") if row else self.ord_symbol.text().strip()
+        symbol = row.get("name") if row else ""
         order_type = self.popup_ordtype_combo.currentText().strip() if self.popup_ordtype_combo else "MARKET"
         qty = self.popup_qty_input.text().strip() if self.popup_qty_input else "1"
         price = self.popup_price_input.text().strip() if self.popup_price_input else "0"
@@ -1992,13 +2488,97 @@ class TradingWindow(QMainWindow):
                 self.bus.error.emit("Invalid Price", "Limit/IOC orders require price > 0.")
                 return
 
-        self.ord_token.setText(str(self.active_token))
-        self.ord_symbol.setText(str(symbol or ""))
-        self.ord_qty.setText(str(qty_num))
-        self.ord_price.setText(price or "0")
-        self.ord_buysell.setText(side)
-        self.ord_type.setText(order_type)
-        self.place_order()
+        self._submit_order(
+            token=str(self.active_token),
+            symbol=str(symbol or ""),
+            qty=str(qty_num),
+            price=price or "0",
+            side=side,
+            ordtype=order_type,
+            trigprice="0",
+        )
+
+    def _selected_watch_row(self):
+        indexes = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not indexes:
+            return None
+        token = self.model.token_at_row(indexes[0].row())
+        if not token:
+            return None
+        return self.model.row_by_token(token)
+
+    def open_quick_order_for_selection(self, side):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+        row = self._selected_watch_row()
+        if not row:
+            self.bus.error.emit("No Selection", "Select a watchlist row first.")
+            return
+        token = str(row.get("symbol") or "")
+        symbol = str(row.get("name") or "")
+        ltp = _to_float(row.get("ltp"))
+        dialog = QuickOrderDialog(self, side=side, token=token, symbol=symbol, ltp=ltp)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.payload()
+        self._submit_order(
+            token=payload["token"],
+            symbol=payload["symbol"],
+            qty=payload["qty"],
+            price=payload["price"],
+            side=side,
+            ordtype=payload["ordtype"],
+            trigprice=payload["trigger"],
+        )
+
+    @staticmethod
+    def _map_side_flag(value):
+        text = str(value or "").strip().upper()
+        if text in ("1", "BUY", "B"):
+            return "1"
+        if text in ("2", "SELL", "S"):
+            return "2"
+        raise ValueError("Invalid Buy/Sell. Use 1/BUY for buy or 2/SELL for sell.")
+
+    @staticmethod
+    def _map_ordtype_flag(value):
+        text = str(value or "").strip().upper()
+        if text in ("1", "LIMIT", "LMT"):
+            return "1"
+        if text in ("2", "MARKET", "MKT"):
+            return "2"
+        if text in ("3", "IOC"):
+            return "3"
+        raise ValueError("Invalid Order Type. Use 1/LIMIT, 2/MARKET, or 3/IOC.")
+
+    def _submit_order(self, token, symbol, qty, price, side, ordtype, trigprice="0"):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Connect first.")
+            return
+
+        def task():
+            side_flag = self._map_side_flag(side)
+            ordtype_flag = self._map_ordtype_flag(ordtype)
+            price_value = str(price)
+            if ordtype_flag == "2":
+                price_value = "0"
+            resp = self.api.place_order(
+                tokenno=str(token),
+                symbol=str(symbol),
+                lot="1",
+                qty=str(qty),
+                price=price_value,
+                buysell=side_flag,
+                ordtype=ordtype_flag,
+                trigprice=str(trigprice),
+                exchange="NSE",
+                validity="0",
+                strategyname="GreekViewPro",
+            )
+            self.bus.log.emit(f"Place order response: {resp}")
+
+        self._run_bg(task, "Place Order")
 
     def open_login_popup(self):
         if self.api:
@@ -2030,6 +2610,7 @@ class TradingWindow(QMainWindow):
             try:
                 df = self.api.get_contract_data()
                 self._build_contract_lookup(df)
+                self.bus.contract_ready.emit()
                 self.bus.log.emit(f"Contract data loaded: {len(self.token_metadata)} tokens.")
             except Exception as exc:
                 self.bus.log.emit(f"Contract data load failed: {exc}")
@@ -2050,6 +2631,7 @@ class TradingWindow(QMainWindow):
             self.bus.clear_watch.emit()
             self.account_auto_refresh_timer.stop()
             self.contract_df = None
+            self.contract_cache = {}
             self.contract_lookup.clear()
             self.token_metadata.clear()
             self.index_tokens.clear()
@@ -2233,64 +2815,28 @@ class TradingWindow(QMainWindow):
             self.perf_badge.setText(f"ticks/s: {tps}  backlog: {backlog}  dropped: {dropped}")
 
     def place_order(self, side_override=None):
-        if not self.api:
-            self.bus.error.emit("Not Connected", "Connect first.")
+        row = self._selected_watch_row()
+        if not row:
+            self.bus.error.emit("No Selection", "Select a watchlist row first.")
             return
-
-        def map_side_flag(value):
-            text = str(value or "").strip().upper()
-            if text in ("1", "BUY", "B"):
-                return "1"
-            if text in ("2", "SELL", "S"):
-                return "2"
-            raise ValueError("Invalid Buy/Sell. Use 1/BUY for buy or 2/SELL for sell.")
-
-        def map_ordtype_flag(value):
-            text = str(value or "").strip().upper()
-            if text in ("1", "LIMIT", "LMT"):
-                return "1"
-            if text in ("2", "MARKET", "MKT"):
-                return "2"
-            if text in ("3", "IOC"):
-                return "3"
-            raise ValueError("Invalid Order Type. Use 1/LIMIT, 2/MARKET, or 3/IOC.")
-
-        def task():
-            side_flag = map_side_flag(side_override if side_override else self.ord_buysell.text().strip())
-            if side_override:
-                ordtype_flag = "2"
-                price_value = "0"
-            else:
-                ordtype_flag = map_ordtype_flag(self.ord_type.text().strip())
-                price_value = self.ord_price.text().strip()
-                if ordtype_flag == "2":
-                    price_value = "0"
-
-            resp = self.api.place_order(
-                tokenno=self.ord_token.text().strip(),
-                symbol=self.ord_symbol.text().strip(),
-                lot=self.ord_lot.text().strip(),
-                qty=self.ord_qty.text().strip(),
-                price=price_value,
-                buysell=side_flag,
-                ordtype=ordtype_flag,
-                trigprice=self.ord_trig.text().strip(),
-                exchange=self.ord_exchange.text().strip(),
-                validity=self.ord_validity.text().strip(),
-                strategyname=self.ord_strategy.text().strip(),
-            )
-            self.bus.log.emit(f"Place order response: {resp}")
-            self.bus.refresh_orderbook.emit()
-
-        self._run_bg(task, "Place Order")
+        side = side_override if side_override else "BUY"
+        self._submit_order(
+            token=row.get("symbol"),
+            symbol=row.get("name") or "",
+            qty="1",
+            price="0",
+            side=side,
+            ordtype="MARKET",
+            trigprice="0",
+        )
 
     def cancel_order(self):
         if not self.api:
             self.bus.error.emit("Not Connected", "Connect first.")
             return
-        order_id = self.cancel_order_id.text().strip()
+        order_id, ok = QInputDialog.getText(self, "Cancel Order", "Order ID:")
+        order_id = order_id.strip() if ok and order_id else ""
         if not order_id:
-            self.bus.error.emit("Missing Order ID", "Enter order ID to cancel.")
             return
 
         def task():
