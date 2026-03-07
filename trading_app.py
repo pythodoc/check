@@ -31,7 +31,6 @@ try:
         QPushButton,
         QSplitter,
         QTableView,
-        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -142,6 +141,7 @@ class SignalBus(QObject):
     clear_watch = Signal()
     remove_tokens = Signal(list)
     contract_ready = Signal()
+    strategy_rows = Signal(list)
 
 
 class MarketTableModel(QAbstractTableModel):
@@ -1093,6 +1093,80 @@ class QuickOrderDialog(QDialog):
         }
 
 
+class StrategyBasketDialog(QDialog):
+    def __init__(self, parent=None, title="", legs=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.setWindowTitle("Strategy Basket")
+        self.resize(760, 460)
+        self._legs = list(legs or [])
+
+        layout = QVBoxLayout(self)
+        if title:
+            header = QLabel(title)
+            header.setStyleSheet("font-size: 14px; font-weight: 700; color: #dbeafe;")
+            layout.addWidget(header)
+
+        self.table = QTableView()
+        self.model = AccountTableModel()
+        self.table.setModel(self.model)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Order Type"))
+        self.ordtype_combo = QComboBox()
+        self.ordtype_combo.addItems(["MARKET", "LIMIT", "IOC"])
+        controls.addWidget(self.ordtype_combo)
+        controls.addWidget(QLabel("Qty"))
+        self.qty_input = QLineEdit("1")
+        self.qty_input.setMaximumWidth(100)
+        controls.addWidget(self.qty_input)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Place Basket")
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        rows = []
+        for leg in self._legs:
+            rows.append(
+                {
+                    "side": leg.get("side", ""),
+                    "token": leg.get("token", ""),
+                    "symbol": leg.get("symbol", ""),
+                    "option": leg.get("option", ""),
+                    "strike": leg.get("strike", ""),
+                    "price": leg.get("price", ""),
+                }
+            )
+        self.model.set_records(["side", "token", "symbol", "option", "strike", "price"], rows)
+
+    def _validate_and_accept(self):
+        try:
+            qty = int(float(self.qty_input.text().strip() or "0"))
+        except Exception:
+            QMessageBox.warning(self, "Invalid Qty", "Qty must be numeric.")
+            return
+        if qty <= 0:
+            QMessageBox.warning(self, "Invalid Qty", "Qty must be greater than 0.")
+            return
+        self.accept()
+
+    def payload(self):
+        return {
+            "qty": str(int(float(self.qty_input.text().strip() or "1"))),
+            "ordtype": self.ordtype_combo.currentText().strip().upper(),
+            "legs": list(self._legs),
+        }
+
+
 class TradingWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1112,6 +1186,8 @@ class TradingWindow(QMainWindow):
         self.bus.clear_watch.connect(self._clear_watch_ui)
         self.bus.remove_tokens.connect(self.model_remove_tokens)
         self.bus.contract_ready.connect(self._refresh_contract_filters)
+        self.bus.contract_ready.connect(self._refresh_strategy_filters)
+        self.bus.strategy_rows.connect(self._set_strategy_rows)
 
         self.model = MarketTableModel()
         self.account_model = AccountTableModel()
@@ -1122,6 +1198,7 @@ class TradingWindow(QMainWindow):
         self.stream_thread = None
         self.ui_queue = queue.Queue(maxsize=30000)
         self.current_tokens = set()
+        self.stream_subscribed_tokens = set()
         self.active_token = None
         self._perf_counter = 0
         self.contract_df = None
@@ -1131,6 +1208,7 @@ class TradingWindow(QMainWindow):
         self.token_metadata = {}
         self.primary_index_token = "101999957"
         self.index_tokens = {self.primary_index_token}
+        self.didx_tokens = set()
         self._ohlc_request_key = None
         self.chart_popup = None
         self.chart_popup_widget = None
@@ -1168,6 +1246,19 @@ class TradingWindow(QMainWindow):
         self._account_refresh_inflight = False
         self._pending_cancel_shortcut = None
         self._pending_modify_shortcut = None
+        self._perf_shortcut = None
+        self.index_popup = None
+        self.index_popup_model = None
+        self.index_popup_table = None
+        self.index_latest = {}
+        self.strategy_popup = None
+        self.strategy_model = None
+        self.strategy_table = None
+        self.strategy_exchange_combo = None
+        self.strategy_symbol_combo = None
+        self.strategy_expiry_combo = None
+        self.strategy_view_combo = None
+        self.strategy_risk_input = None
 
         self._build_ui()
         self._set_logged_in_state(False)
@@ -1325,23 +1416,13 @@ class TradingWindow(QMainWindow):
         )
         row.addWidget(self.status_label)
 
-        row.addSpacing(16)
-        row.addWidget(QLabel("Focus Token"))
-        self.focus_token_input = QLineEdit()
-        self.focus_token_input.setPlaceholderText("Type token and press Enter")
-        self.focus_token_input.returnPressed.connect(self.focus_token_from_toolbar)
-        self.focus_token_input.setMinimumWidth(180)
-        self.focus_token_input.setMaximumWidth(300)
-        row.addWidget(self.focus_token_input)
-
-        btn_focus = QPushButton("Go")
-        btn_focus.clicked.connect(self.focus_token_from_toolbar)
-        row.addWidget(btn_focus)
-
         row.addSpacing(12)
-        self.btn_perf = QPushButton("Perf Stats")
-        self.btn_perf.clicked.connect(self.show_perf_stats)
-        row.addWidget(self.btn_perf)
+        self.btn_index_popup = QPushButton("Index View")
+        self.btn_index_popup.clicked.connect(self.show_index_popup)
+        row.addWidget(self.btn_index_popup)
+        self.btn_strategy = QPushButton("Strategy Finder")
+        self.btn_strategy.clicked.connect(self.show_strategy_finder)
+        row.addWidget(self.btn_strategy)
 
         self.perf_badge = QLabel("ticks/s: -  backlog: -")
         self.perf_badge.setStyleSheet("color: #93c5fd; font-weight: 600;")
@@ -1350,18 +1431,6 @@ class TradingWindow(QMainWindow):
         self.server_time_label.setStyleSheet("color: #a7f3d0; font-weight: 600;")
         row.addWidget(self.server_time_label)
         row.addSpacing(10)
-
-        self.active_symbol_label = QLabel("Token: -")
-        self.ltp_label = QLabel("LTP: -")
-        self.chg_label = QLabel("Change: -")
-        self.vol_label = QLabel("Volume: -")
-        self.oi_label = QLabel("OI: -")
-        self.time_label = QLabel("LUT: -")
-        self.ltp_label.setStyleSheet("font-size: 13px; font-weight: 700; color: #fef08a;")
-        self.chg_label.setStyleSheet("font-size: 13px; font-weight: 700; color: #cbd5e1;")
-        for widget in (self.active_symbol_label, self.ltp_label, self.chg_label, self.vol_label, self.oi_label, self.time_label):
-            row.addWidget(widget)
-            row.addSpacing(6)
         row.addStretch(1)
         return bar
 
@@ -1440,22 +1509,27 @@ class TradingWindow(QMainWindow):
         return panel
 
     def _build_bottom_console(self):
-        tabs = QTabWidget()
-        self.bottom_tabs = tabs
-
-        logs_tab = QWidget()
-        logs_layout = QVBoxLayout(logs_tab)
+        logs_box = QGroupBox("Logs")
+        logs_layout = QVBoxLayout(logs_box)
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setStyleSheet("background-color: #0a111d; color: #9fd3ff;")
         logs_layout.addWidget(self.log_output, 1)
-
-        tabs.addTab(logs_tab, "Logs")
-        return tabs
+        return logs_box
 
     def _append_log(self, message):
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_output.appendPlainText(f"[{ts}] {message}")
+        line = f"[{ts}] {message}"
+        old = self.log_output.toPlainText()
+        if old:
+            # Newest-first log view for quicker issue triage.
+            merged = f"{line}\n{old}"
+            lines = merged.splitlines()
+            if len(lines) > 2000:
+                merged = "\n".join(lines[:2000])
+            self.log_output.setPlainText(merged)
+        else:
+            self.log_output.setPlainText(line)
 
     def _show_error(self, title, text):
         QMessageBox.critical(self, title, text)
@@ -1494,9 +1568,11 @@ class TradingWindow(QMainWindow):
             self.chart_popup_widget.set_active_token(None)
         self.active_token = None
         self.current_tokens.clear()
+        self.index_latest.clear()
         self._set_quote_strip(None)
         self.ws_server_time_text = "-"
         self.server_time_label.setText("WS Time: -")
+        self._refresh_index_popup_table()
 
     def model_remove_tokens(self, tokens):
         self.model.remove_tokens(tokens)
@@ -1540,6 +1616,605 @@ class TradingWindow(QMainWindow):
         self.account_model.set_records(columns, rows)
         self._ensure_account_popup(title)
         self.bus.log.emit(f"{title} table updated: {len(rows)} row(s).")
+
+    def _ensure_index_popup(self):
+        if self.index_popup is None:
+            self.index_popup = QDialog(self)
+            self.index_popup.setModal(False)
+            self.index_popup.resize(700, 520)
+            self.index_popup.setWindowTitle("Index View")
+            layout = QVBoxLayout(self.index_popup)
+            self.index_popup_table = QTableView()
+            self.index_popup_model = AccountTableModel()
+            self.index_popup_table.setModel(self.index_popup_model)
+            self.index_popup_table.setAlternatingRowColors(True)
+            self.index_popup_table.verticalHeader().setVisible(False)
+            self.index_popup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            self.index_popup_table.horizontalHeader().setStretchLastSection(True)
+            layout.addWidget(self.index_popup_table, 1)
+        return self.index_popup
+
+    def show_index_popup(self):
+        if self.api and (not self.streaming_active or not self.stream_thread or not self.stream_thread.is_alive()):
+            auto_index_tokens = sorted(set(self.didx_tokens))
+            if auto_index_tokens:
+                self._start_stream_for_tokens(auto_index_tokens, source_label="IndexViewAuto", track_watchlist=False)
+            else:
+                self._start_stream_for_tokens([self.primary_index_token], source_label="IndexViewAuto", track_watchlist=False)
+        popup = self._ensure_index_popup()
+        self._refresh_index_popup_table()
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+    def _refresh_index_popup_table(self):
+        if not self.index_popup_model:
+            return
+        rows = []
+        target_tokens = set(self.didx_tokens) if self.didx_tokens else set(self.index_tokens)
+        for token, row in self.index_latest.items():
+            if token not in target_tokens:
+                continue
+            rows.append(
+                {
+                    "symbol": token,
+                    "name": row.get("name", ""),
+                    "ltp": _format_number(row.get("ltp"), 2),
+                    "p_change": _format_number(row.get("p_change"), 2),
+                    "change": _format_number(row.get("change"), 2),
+                    "lut": _format_ws_time(row.get("lut") or row.get("ltt")) or "-",
+                }
+            )
+        rows.sort(key=lambda r: _to_float(r.get("p_change")) or 0.0, reverse=True)
+        self.index_popup_model.set_records(["symbol", "name", "ltp", "p_change", "change", "lut"], rows)
+
+    def _strategy_fo_exchanges(self):
+        exchanges = self.contract_cache.get("exchanges", []) if self.contract_cache else []
+        return [ex for ex in exchanges if self._is_fo_segment(ex)]
+
+    def _strategy_symbols_for_exchange(self, exchange):
+        if not exchange:
+            return []
+        values = self.contract_cache.get("exchange_to_symbols", {}).get(exchange, [])
+        return list(values)
+
+    def _strategy_expiries(self, exchange, symbol):
+        if not exchange or not symbol:
+            return []
+        expiry_set = set()
+        fo_rows = self.contract_cache.get("fo_rows_by_exsyminst", {})
+        for (ex, sym, inst), rows in fo_rows.items():
+            if ex != exchange or sym != symbol or "OPT" not in str(inst).upper():
+                continue
+            for row in rows:
+                exp = self._to_text(row.get("expiry"))
+                if exp:
+                    expiry_set.add(exp)
+        return self._sort_mixed(expiry_set)
+
+    def _ensure_strategy_popup(self):
+        if self.strategy_popup is not None:
+            return self.strategy_popup
+
+        self.strategy_popup = QDialog(self)
+        self.strategy_popup.setModal(False)
+        self.strategy_popup.resize(1100, 700)
+        self.strategy_popup.setWindowTitle("Strategy Finder")
+        layout = QVBoxLayout(self.strategy_popup)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Exchange"))
+        self.strategy_exchange_combo = QComboBox()
+        self.strategy_exchange_combo.currentTextChanged.connect(self._on_strategy_exchange_changed)
+        filters.addWidget(self.strategy_exchange_combo)
+        filters.addWidget(QLabel("Symbol"))
+        self.strategy_symbol_combo = QComboBox()
+        self.strategy_symbol_combo.setEditable(True)
+        self.strategy_symbol_combo.currentTextChanged.connect(self._on_strategy_symbol_changed)
+        filters.addWidget(self.strategy_symbol_combo, 1)
+        filters.addWidget(QLabel("Expiry"))
+        self.strategy_expiry_combo = QComboBox()
+        filters.addWidget(self.strategy_expiry_combo)
+        filters.addWidget(QLabel("View"))
+        self.strategy_view_combo = QComboBox()
+        self.strategy_view_combo.addItems(["Range", "Bullish", "Bearish", "Volatility"])
+        filters.addWidget(self.strategy_view_combo)
+        filters.addWidget(QLabel("Risk Budget"))
+        self.strategy_risk_input = QLineEdit("10000")
+        self.strategy_risk_input.setMaximumWidth(120)
+        filters.addWidget(self.strategy_risk_input)
+        scan_btn = QPushButton("Scan")
+        scan_btn.clicked.connect(self._scan_strategies)
+        filters.addWidget(scan_btn)
+        basket_btn = QPushButton("Load Basket")
+        basket_btn.clicked.connect(self._load_selected_strategy_basket)
+        filters.addWidget(basket_btn)
+        layout.addLayout(filters)
+
+        self.strategy_table = QTableView()
+        self.strategy_model = AccountTableModel()
+        self.strategy_table.setModel(self.strategy_model)
+        self.strategy_table.setAlternatingRowColors(True)
+        self.strategy_table.verticalHeader().setVisible(False)
+        self.strategy_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.strategy_table.horizontalHeader().setStretchLastSection(True)
+        self.strategy_table.doubleClicked.connect(lambda *_: self._load_selected_strategy_basket())
+        layout.addWidget(self.strategy_table, 1)
+        return self.strategy_popup
+
+    def show_strategy_finder(self):
+        popup = self._ensure_strategy_popup()
+        self._refresh_strategy_filters()
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+    def _refresh_strategy_filters(self):
+        if not self.strategy_exchange_combo:
+            return
+        exchanges = self._strategy_fo_exchanges()
+        self._combo_fill(self.strategy_exchange_combo, exchanges)
+        self._combo_fill(self.strategy_symbol_combo, [])
+        self._combo_fill(self.strategy_expiry_combo, [])
+
+    def _on_strategy_exchange_changed(self, value):
+        exchange = self._to_text(value).upper()
+        symbols = self._strategy_symbols_for_exchange(exchange)
+        self._combo_fill(self.strategy_symbol_combo, symbols)
+        self._combo_fill(self.strategy_expiry_combo, [])
+
+    def _on_strategy_symbol_changed(self, value):
+        exchange = self._to_text(self.strategy_exchange_combo.currentText()).upper()
+        symbol = self._to_text(value).upper()
+        expiries = self._strategy_expiries(exchange, symbol)
+        self._combo_fill(self.strategy_expiry_combo, expiries)
+
+    def _quote_for_row(self, row, cache):
+        token = str(row.get("token") or "").strip()
+        if not token:
+            return {}
+        if token in cache:
+            return cache[token]
+        watch = self.model.row_by_token(token)
+        if watch:
+            out = {
+                "ltp": _to_float(watch.get("ltp")),
+                "bid": _to_float(watch.get("bid")),
+                "ask": _to_float(watch.get("ask")),
+                "tot_vol": _to_float(watch.get("tot_vol")),
+                "oi": _to_float(watch.get("oi")),
+            }
+            cache[token] = out
+            return out
+        quote = {}
+        try:
+            raw = self.api.token_broadcast(token, row.get("inst") or row.get("asset_type") or "")
+            quote = {
+                "ltp": _to_float((raw or {}).get("ltp")),
+                "bid": _to_float((raw or {}).get("bid")),
+                "ask": _to_float((raw or {}).get("ask")),
+                "tot_vol": _to_float((raw or {}).get("tot_vol")),
+                "oi": _to_float((raw or {}).get("oi")),
+            }
+        except Exception:
+            quote = {}
+        cache[token] = quote
+        return quote
+
+    def _underlying_spot(self, symbol):
+        eq = self.contract_cache.get("eq_row_by_exsym", {}).get(("NSEEQ", symbol)) or self.contract_cache.get("eq_row_by_exsym", {}).get(("BSEEQ", symbol))
+        if not eq:
+            return None
+        token = str(eq.get("token") or "").strip()
+        if not token:
+            return None
+        watch = self.model.row_by_token(token)
+        if watch:
+            v = _to_float(watch.get("ltp"))
+            if v is not None and v > 0:
+                return v
+        try:
+            q = self.api.token_broadcast(token, eq.get("asset_type") or "EQ")
+            v = _to_float((q or {}).get("ltp"))
+            if v is not None and v > 0:
+                return v
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _safe_price(quote, side):
+        if side == "buy":
+            return _to_float(quote.get("ask")) or _to_float(quote.get("ltp")) or 0.0
+        return _to_float(quote.get("bid")) or _to_float(quote.get("ltp")) or 0.0
+
+    @staticmethod
+    def _fmt_money(value):
+        if isinstance(value, str):
+            return value
+        if value is None:
+            return "-"
+        return f"{value:,.2f}"
+
+    @staticmethod
+    def _order_exchange_from_segment(segment):
+        text = str(segment or "").upper()
+        if text.startswith("BSE"):
+            return "BSE"
+        return "NSE"
+
+    def _selected_strategy_row(self):
+        if not self.strategy_table or not self.strategy_model:
+            return None
+        model = self.strategy_table.selectionModel()
+        if not model:
+            return None
+        rows = model.selectedRows()
+        if not rows:
+            return None
+        return self.strategy_model.row_at(rows[0].row())
+
+    def _parse_strategy_legs(self, legs_text):
+        items = []
+        text = str(legs_text or "").strip()
+        if not text:
+            return items
+        for part in text.split("+"):
+            p = part.strip()
+            if not p:
+                continue
+            toks = [x for x in p.split(" ") if x]
+            if len(toks) < 3:
+                continue
+            side = toks[0].strip().upper()
+            option = toks[1].strip().upper()
+            try:
+                strike = float(toks[2])
+            except Exception:
+                continue
+            if side in ("BUY", "SELL") and option in ("CE", "PE"):
+                items.append({"side": side, "option": option, "strike": strike})
+        return items
+
+    def _resolve_strategy_leg_contracts(self, exchange, symbol, expiry, parsed_legs):
+        rows = []
+        fo_rows = self.contract_cache.get("fo_rows_by_exsyminst", {})
+        by_key = {}
+        for (ex, sym, inst), contracts in fo_rows.items():
+            if ex != exchange or sym != symbol or "OPT" not in str(inst).upper():
+                continue
+            for row in contracts:
+                row_exp = self._to_text(row.get("expiry"))
+                row_opt = self._to_text(row.get("option")).upper()
+                strike = _to_float(row.get("strike"))
+                if row_exp == expiry and row_opt in ("CE", "PE") and strike is not None:
+                    by_key[(row_opt, round(float(strike), 6))] = row
+        for leg in parsed_legs:
+            key = (leg["option"], round(float(leg["strike"]), 6))
+            row = by_key.get(key)
+            if not row:
+                return []
+            rows.append(row)
+        return rows
+
+    def _price_for_strategy_leg(self, leg_row, side):
+        quote = self._quote_for_row(leg_row, {})
+        if side == "BUY":
+            price = _to_float(quote.get("ask")) or _to_float(quote.get("ltp"))
+        else:
+            price = _to_float(quote.get("bid")) or _to_float(quote.get("ltp"))
+        if price is None or price <= 0:
+            return None
+        return float(price)
+
+    def _load_selected_strategy_basket(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+        row = self._selected_strategy_row()
+        if not row:
+            self.bus.error.emit("No Selection", "Select a strategy row first.")
+            return
+        exchange = self._to_text(self.strategy_exchange_combo.currentText()).upper() if self.strategy_exchange_combo else ""
+        symbol = self._to_text(self.strategy_symbol_combo.currentText()).upper() if self.strategy_symbol_combo else ""
+        expiry = self._to_text(self.strategy_expiry_combo.currentText()) if self.strategy_expiry_combo else ""
+        parsed = self._parse_strategy_legs(row.get("legs"))
+        if not (exchange and symbol and expiry and parsed):
+            self.bus.error.emit("Invalid Strategy", "Select valid strategy row with Exchange, Symbol, and Expiry.")
+            return
+        contracts = self._resolve_strategy_leg_contracts(exchange, symbol, expiry, parsed)
+        if len(contracts) != len(parsed):
+            self.bus.error.emit("Contracts Missing", "Could not map all strategy legs to option contracts.")
+            return
+        legs = []
+        for leg, contract in zip(parsed, contracts):
+            token = str(contract.get("token") or "").strip()
+            if not token:
+                self.bus.error.emit("Contract Error", "Missing token in selected strategy leg.")
+                return
+            price = self._price_for_strategy_leg(contract, leg["side"])
+            if price is None:
+                self.bus.error.emit("Price Error", f"Unable to fetch live price for {leg['option']} {leg['strike']}.")
+                return
+            legs.append(
+                {
+                    "side": leg["side"],
+                    "option": leg["option"],
+                    "strike": f"{leg['strike']:.2f}",
+                    "token": token,
+                    "symbol": contract.get("name") or symbol,
+                    "exchange_segment": exchange,
+                    "price": f"{price:.2f}",
+                }
+            )
+        title = f"{row.get('strategy') or 'Strategy'} | {symbol} | {expiry}"
+        dialog = StrategyBasketDialog(self, title=title, legs=legs)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.payload()
+        self._place_strategy_basket_orders(title, payload.get("legs", []), payload.get("qty", "1"), payload.get("ordtype", "MARKET"))
+
+    def _place_strategy_basket_orders(self, strategy_name, legs, qty, ordtype):
+        if not legs:
+            return
+        try:
+            qty_num = int(float(qty or "0"))
+        except Exception:
+            self.bus.error.emit("Invalid Qty", "Qty must be numeric.")
+            return
+        if qty_num <= 0:
+            self.bus.error.emit("Invalid Qty", "Qty must be greater than 0.")
+            return
+        try:
+            ordtype_flag = self._map_ordtype_flag(ordtype)
+        except Exception as exc:
+            self.bus.error.emit("Invalid Order Type", str(exc))
+            return
+
+        def task():
+            results = []
+            for leg in legs:
+                try:
+                    side_flag = self._map_side_flag(leg.get("side"))
+                    price = "0" if ordtype_flag == "2" else str(leg.get("price") or "0")
+                    exchange = self._order_exchange_from_segment(leg.get("exchange_segment"))
+                    resp = self.api.place_order(
+                        tokenno=str(leg.get("token")),
+                        symbol=str(leg.get("symbol") or ""),
+                        lot="1",
+                        qty=str(qty_num),
+                        price=price,
+                        buysell=side_flag,
+                        ordtype=ordtype_flag,
+                        trigprice="0",
+                        exchange=exchange,
+                        validity="0",
+                        strategyname=str(strategy_name or "StrategyBasket"),
+                    )
+                    results.append({"token": leg.get("token"), "side": leg.get("side"), "status": "ok", "resp": resp})
+                except Exception as exc:
+                    results.append({"token": leg.get("token"), "side": leg.get("side"), "status": "error", "resp": str(exc)})
+            ok_count = len([r for r in results if r.get("status") == "ok"])
+            self.bus.log.emit(f"Strategy basket placed: {ok_count}/{len(results)} legs successful.")
+            self.bus.log.emit(f"Basket result: {json.dumps(results, default=str)}")
+
+        self._run_bg(task, "Place Strategy Basket")
+
+    def _scan_strategies(self):
+        if not self.api:
+            self.bus.error.emit("Not Connected", "Login first.")
+            return
+        exchange = self._to_text(self.strategy_exchange_combo.currentText()).upper() if self.strategy_exchange_combo else ""
+        symbol = self._to_text(self.strategy_symbol_combo.currentText()).upper() if self.strategy_symbol_combo else ""
+        expiry = self._to_text(self.strategy_expiry_combo.currentText()) if self.strategy_expiry_combo else ""
+        view = self._to_text(self.strategy_view_combo.currentText()).lower() if self.strategy_view_combo else "range"
+        risk_budget = _to_float(self.strategy_risk_input.text()) if self.strategy_risk_input else None
+        if not (exchange and symbol and expiry):
+            self.bus.error.emit("Missing Filters", "Select Exchange, Symbol and Expiry.")
+            return
+
+        def task():
+            rows = []
+            fo_rows = self.contract_cache.get("fo_rows_by_exsyminst", {})
+            for (ex, sym, inst), items in fo_rows.items():
+                if ex != exchange or sym != symbol or "OPT" not in str(inst).upper():
+                    continue
+                for item in items:
+                    if self._to_text(item.get("expiry")) == expiry:
+                        opt = self._to_text(item.get("option")).upper()
+                        strike = _to_float(item.get("strike"))
+                        if opt in ("CE", "PE") and strike is not None:
+                            row = dict(item)
+                            row["opt"] = opt
+                            row["strike_val"] = strike
+                            rows.append(row)
+            if not rows:
+                self.bus.log.emit("Strategy scan: no option contracts found for selection.")
+                self.bus.strategy_rows.emit([])
+                return
+
+            strike_map = {}
+            for row in rows:
+                strike_map.setdefault(row["strike_val"], {})[row["opt"]] = row
+            valid_strikes = sorted([k for k, v in strike_map.items() if "CE" in v and "PE" in v])
+            if len(valid_strikes) < 3:
+                self.bus.log.emit("Strategy scan: insufficient CE/PE strikes for strategy generation.")
+                self.bus.strategy_rows.emit([])
+                return
+
+            spot = self._underlying_spot(symbol)
+            if spot is None:
+                spot = valid_strikes[len(valid_strikes) // 2]
+            atm = min(valid_strikes, key=lambda x: abs(x - spot))
+            atm_idx = valid_strikes.index(atm)
+            start = max(0, atm_idx - 3)
+            end = min(len(valid_strikes), atm_idx + 4)
+            work_strikes = valid_strikes[start:end]
+            qcache = {}
+            for strike in work_strikes:
+                self._quote_for_row(strike_map[strike]["CE"], qcache)
+                self._quote_for_row(strike_map[strike]["PE"], qcache)
+
+            def ce(strike):
+                return strike_map.get(strike, {}).get("CE")
+
+            def pe(strike):
+                return strike_map.get(strike, {}).get("PE")
+
+            def q(row):
+                return self._quote_for_row(row, qcache) if row else {}
+
+            def liquidity(*quotes):
+                vol = sum((_to_float(v.get("tot_vol")) or 0.0) for v in quotes)
+                oi = sum((_to_float(v.get("oi")) or 0.0) for v in quotes)
+                return min(40.0, (vol / 5000.0) + (oi / 20000.0))
+
+            candidates = []
+            if ce(atm) and pe(atm):
+                ceq = q(ce(atm))
+                peq = q(pe(atm))
+                debit = self._safe_price(ceq, "buy") + self._safe_price(peq, "buy")
+                credit = self._safe_price(ceq, "sell") + self._safe_price(peq, "sell")
+                candidates.append(
+                    {
+                        "strategy": "Long Straddle",
+                        "legs": f"BUY CE {atm} + BUY PE {atm}",
+                        "cost": debit,
+                        "max_profit": "Unlimited",
+                        "max_loss": debit,
+                        "breakeven": f"{atm - debit:.2f} / {atm + debit:.2f}",
+                        "liq": liquidity(ceq, peq),
+                    }
+                )
+                candidates.append(
+                    {
+                        "strategy": "Short Straddle",
+                        "legs": f"SELL CE {atm} + SELL PE {atm}",
+                        "cost": -credit,
+                        "max_profit": credit,
+                        "max_loss": "Unlimited",
+                        "breakeven": f"{atm - credit:.2f} / {atm + credit:.2f}",
+                        "liq": liquidity(ceq, peq),
+                    }
+                )
+
+            if atm_idx + 1 < len(valid_strikes):
+                k2 = valid_strikes[atm_idx + 1]
+                if ce(atm) and ce(k2):
+                    buyq = q(ce(atm))
+                    sellq = q(ce(k2))
+                    debit = self._safe_price(buyq, "buy") - self._safe_price(sellq, "sell")
+                    maxp = max(0.0, (k2 - atm) - debit)
+                    candidates.append(
+                        {
+                            "strategy": "Bull Call Spread",
+                            "legs": f"BUY CE {atm} + SELL CE {k2}",
+                            "cost": debit,
+                            "max_profit": maxp,
+                            "max_loss": max(0.0, debit),
+                            "breakeven": f"{atm + debit:.2f}",
+                            "liq": liquidity(buyq, sellq),
+                        }
+                    )
+                if pe(atm) and pe(k2):
+                    buyq = q(pe(k2))
+                    sellq = q(pe(atm))
+                    debit = self._safe_price(buyq, "buy") - self._safe_price(sellq, "sell")
+                    maxp = max(0.0, (k2 - atm) - debit)
+                    candidates.append(
+                        {
+                            "strategy": "Bear Put Spread",
+                            "legs": f"BUY PE {k2} + SELL PE {atm}",
+                            "cost": debit,
+                            "max_profit": maxp,
+                            "max_loss": max(0.0, debit),
+                            "breakeven": f"{atm - debit:.2f}",
+                            "liq": liquidity(buyq, sellq),
+                        }
+                    )
+
+            if atm_idx - 1 >= 0 and atm_idx + 1 < len(valid_strikes):
+                lp = valid_strikes[atm_idx - 1]
+                hc = valid_strikes[atm_idx + 1]
+                if pe(lp) and ce(hc):
+                    peq = q(pe(lp))
+                    ceq = q(ce(hc))
+                    debit = self._safe_price(peq, "buy") + self._safe_price(ceq, "buy")
+                    credit = self._safe_price(peq, "sell") + self._safe_price(ceq, "sell")
+                    candidates.append(
+                        {
+                            "strategy": "Long Strangle",
+                            "legs": f"BUY PE {lp} + BUY CE {hc}",
+                            "cost": debit,
+                            "max_profit": "Unlimited",
+                            "max_loss": debit,
+                            "breakeven": f"{lp - debit:.2f} / {hc + debit:.2f}",
+                            "liq": liquidity(peq, ceq),
+                        }
+                    )
+                    candidates.append(
+                        {
+                            "strategy": "Short Strangle",
+                            "legs": f"SELL PE {lp} + SELL CE {hc}",
+                            "cost": -credit,
+                            "max_profit": credit,
+                            "max_loss": "Unlimited",
+                            "breakeven": f"{lp - credit:.2f} / {hc + credit:.2f}",
+                            "liq": liquidity(peq, ceq),
+                        }
+                    )
+
+            def view_bonus(name):
+                n = name.lower()
+                if view == "bullish":
+                    return 12 if ("bull" in n or "long call" in n) else (-6 if "bear" in n else 0)
+                if view == "bearish":
+                    return 12 if ("bear" in n or "long put" in n) else (-6 if "bull" in n else 0)
+                if view == "range":
+                    return 10 if ("short straddle" in n or "short strangle" in n or "condor" in n) else 0
+                if view == "volatility":
+                    return 10 if ("long straddle" in n or "long strangle" in n) else 0
+                return 0
+
+            out = []
+            for item in candidates:
+                max_profit = item["max_profit"]
+                max_loss = item["max_loss"]
+                rr_bonus = 0.0
+                if isinstance(max_profit, (int, float)) and isinstance(max_loss, (int, float)) and max_loss > 0:
+                    rr_bonus = min(15.0, (max_profit / max_loss) * 5.0)
+                elif isinstance(max_profit, str) and max_profit.lower().startswith("unlimited") and isinstance(max_loss, (int, float)):
+                    rr_bonus = 8.0
+                budget_bonus = 0.0
+                if risk_budget and isinstance(max_loss, (int, float)) and max_loss > 0:
+                    budget_bonus = 8.0 if max_loss <= risk_budget else -12.0
+                score = 45.0 + item["liq"] + rr_bonus + budget_bonus + view_bonus(item["strategy"])
+                out.append(
+                    {
+                        "strategy": item["strategy"],
+                        "legs": item["legs"],
+                        "expiry": expiry,
+                        "atm": f"{atm:.2f}",
+                        "cost": self._fmt_money(item["cost"]),
+                        "max_profit": self._fmt_money(max_profit),
+                        "max_loss": self._fmt_money(max_loss),
+                        "breakeven": item["breakeven"],
+                        "liquidity": f"{item['liq']:.1f}",
+                        "score": f"{score:.1f}",
+                    }
+                )
+
+            out.sort(key=lambda r: _to_float(r.get("score")) or 0.0, reverse=True)
+            self.bus.strategy_rows.emit(out[:10])
+            self.bus.log.emit(f"Strategy scan complete: {len(out[:10])} result(s).")
+
+        self._run_bg(task, "Strategy Finder")
+
+    def _set_strategy_rows(self, rows):
+        if not self.strategy_model:
+            return
+        columns = ["strategy", "legs", "expiry", "atm", "cost", "max_profit", "max_loss", "breakeven", "liquidity", "score"]
+        self.strategy_model.set_records(columns, rows or [])
 
     @staticmethod
     def _pick_from_row(row, candidates):
@@ -1808,13 +2483,6 @@ class TradingWindow(QMainWindow):
 
     def _set_quote_strip(self, row):
         if not row:
-            self.active_symbol_label.setText("Token: -")
-            self.ltp_label.setText("LTP: -")
-            self.chg_label.setText("Change: -")
-            self.vol_label.setText("Volume: -")
-            self.oi_label.setText("OI: -")
-            self.time_label.setText("LUT: -")
-            self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #cbd5e1;")
             if self.popup_token_label:
                 self.popup_token_label.setText(f"Token: {self.active_token or '-'} | LTP: - | WS: {self.ws_server_time_text}")
             return
@@ -1822,28 +2490,6 @@ class TradingWindow(QMainWindow):
         token = row.get("symbol")
         name = row.get("name")
         ltp = row.get("ltp")
-        change = row.get("change")
-        lut = row.get("lut")
-        volume = row.get("tot_vol")
-        oi = row.get("oi")
-        self.active_symbol_label.setText(f"Token: {token}  |  {name or '-'}")
-        self.ltp_label.setText(f"LTP: {_format_number(ltp, 2)}")
-        chg = _to_float(change)
-        if chg is None:
-            self.chg_label.setText("Change: -")
-            self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #cbd5e1;")
-        else:
-            self.chg_label.setText(f"Change: {chg:+,.2f}")
-            if chg > 0:
-                self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #22c55e;")
-            elif chg < 0:
-                self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #ef4444;")
-            else:
-                self.chg_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #cbd5e1;")
-
-        self.vol_label.setText(f"Volume: {_format_number(volume, 0)}")
-        self.oi_label.setText(f"OI: {_format_number(oi, 0)}")
-        self.time_label.setText(f"LUT: {lut if lut not in (None, '') else '-'}")
         if self.popup_token_label:
             self.popup_token_label.setText(
                 f"Token: {token} | {name or '-'} | LTP: {_format_number(ltp, 2)} | WS: {self.ws_server_time_text}"
@@ -1859,7 +2505,7 @@ class TradingWindow(QMainWindow):
             row = self.model.row_by_token(self.active_token)
             if row:
                 self.popup_token_label.setText(
-                    f"Token: {row[0]} | {row[1] or '-'} | LTP: {_format_number(row[2], 2)} | WS: {text}"
+                    f"Token: {row.get('symbol')} | {row.get('name') or '-'} | LTP: {_format_number(row.get('ltp'), 2)} | WS: {text}"
                 )
 
     def _run_bg(self, fn, name):
@@ -1883,6 +2529,7 @@ class TradingWindow(QMainWindow):
             ("F7", self.fetch_holdings),
             ("F8", self.fetch_margin),
             ("F10", self.open_chart_popup_and_start_broadcast),
+            ("Ctrl+P", self.show_perf_stats),
         )
         for key, handler in mappings:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -1906,17 +2553,18 @@ class TradingWindow(QMainWindow):
         self.token_metadata.clear()
         self.index_tokens.clear()
         self.index_tokens.add(self.primary_index_token)
+        self.didx_tokens.clear()
         if df is None or getattr(df, "empty", True):
             return
 
         token_col = self._pick_column(df.columns, ("gtoken", "token", "symboltoken", "tokenno"))
         if token_col is None:
             token_col = self._pick_column(df.columns, ("greektoken",))
-        symbol_col = self._pick_column(df.columns, ("tradingsymbol", "symbol", "tsym", "name", "sname"))
+        symbol_col = self._pick_column(df.columns, ("symbol", "tradingsymbol", "tsym", "name", "sname"))
         exchange_col = self._pick_column(df.columns, ("exchange", "exch", "exch_seg", "exchange_segment"))
         if exchange_col is None:
             exchange_col = self._pick_column(df.columns, ("exchangesegment",))
-        name_col = self._pick_column(df.columns, ("name", "companyname", "description", "symbol", "tradingsymbol"))
+        name_col = self._pick_column(df.columns, ("description", "name", "companyname", "symbol", "tradingsymbol"))
         asset_col = self._pick_column(df.columns, ("assettype", "asset_type", "instrumenttype", "segment", "series"))
         inst_col = self._pick_column(df.columns, ("series/insttype", "series", "insttype", "instrumenttype"))
         expiry_col = self._pick_column(df.columns, ("expirydate", "expiry", "expdate"))
@@ -1943,6 +2591,7 @@ class TradingWindow(QMainWindow):
             "exchanges": set(),
             "exchange_to_symbols": {},
             "fo_exsym_to_inst": {},
+            "fo_rows_by_exsyminst": {},
             "fo_exsyminst_to_expiry": {},
             "fo_exsyminstexp_to_strike": {},
             "fo_exsyminstexpstrike_to_option": {},
@@ -1970,8 +2619,15 @@ class TradingWindow(QMainWindow):
                     self.contract_lookup[symbol] = token
             self.token_metadata[token] = {"name": name or symbol, "exchange": exchange, "symbol": symbol}
             meta_text = f"{exchange} {symbol} {name} {asset_type}".upper()
-            if ("INDEX" in meta_text) or any(idx in meta_text for idx in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY")):
+            inst_text = inst.upper()
+            if (
+                ("INDEX" in meta_text)
+                or any(idx in meta_text for idx in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY"))
+                or ("IDX" in inst_text and not expiry)
+            ):
                 self.index_tokens.add(token)
+            if inst_text == "DIDX":
+                self.didx_tokens.add(token)
 
             if exchange:
                 cache["exchanges"].add(exchange)
@@ -1994,16 +2650,17 @@ class TradingWindow(QMainWindow):
                 if inst:
                     cache["fo_exsym_to_inst"].setdefault(exsym, set()).add(inst)
                     exsyminst = (exchange, symbol, inst)
+                    cache["fo_rows_by_exsyminst"].setdefault(exsyminst, []).append(row_data)
                     if expiry:
                         cache["fo_exsyminst_to_expiry"].setdefault(exsyminst, set()).add(expiry)
-                        exsyminstexp = (exchange, symbol, inst, expiry)
-                        if strike:
-                            cache["fo_exsyminstexp_to_strike"].setdefault(exsyminstexp, set()).add(strike)
-                            exsyminstexpstrike = (exchange, symbol, inst, expiry, strike)
-                            if option:
-                                cache["fo_exsyminstexpstrike_to_option"].setdefault(exsyminstexpstrike, set()).add(option)
-                                full_key = (exchange, symbol, inst, expiry, strike, option)
-                                cache["fo_row_by_fullkey"][full_key] = row_data
+                    exsyminstexp = (exchange, symbol, inst, expiry)
+                    if strike:
+                        cache["fo_exsyminstexp_to_strike"].setdefault(exsyminstexp, set()).add(strike)
+                    exsyminstexpstrike = (exchange, symbol, inst, expiry, strike)
+                    if option:
+                        cache["fo_exsyminstexpstrike_to_option"].setdefault(exsyminstexpstrike, set()).add(option)
+                    full_key = (exchange, symbol, inst, expiry, strike, option)
+                    cache["fo_row_by_fullkey"][full_key] = row_data
             else:
                 if exsym not in cache["eq_row_by_exsym"]:
                     cache["eq_row_by_exsym"][exsym] = row_data
@@ -2040,6 +2697,11 @@ class TradingWindow(QMainWindow):
     def _is_fo_segment(exchange_segment):
         text = str(exchange_segment or "").upper()
         return text.endswith("FO") or "FO" in text
+
+    @staticmethod
+    def _inst_needs_expiry(inst):
+        text = str(inst or "").upper()
+        return text.startswith("FUT") or text.startswith("OPT")
 
     @staticmethod
     def _sort_mixed(values):
@@ -2125,12 +2787,19 @@ class TradingWindow(QMainWindow):
         exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
         symbol = self._to_text(self.contract_symbol_combo.currentText()).upper()
         inst = self._to_text(value).upper()
+        rows = self.contract_cache.get("fo_rows_by_exsyminst", {}).get((exchange, symbol, inst), []) if inst else []
         expiry_values = []
-        if inst:
+        if rows:
             expiry_values = self.contract_cache.get("fo_exsyminst_to_expiry", {}).get((exchange, symbol, inst), [])
         self._combo_fill(self.contract_expiry_combo, expiry_values)
-        self._combo_fill(self.contract_strike_combo, [])
-        self._combo_fill(self.contract_option_combo, [])
+        if not expiry_values:
+            strikes = self._sort_mixed({self._to_text(r.get("strike")) for r in rows if self._to_text(r.get("strike"))})
+            options = sorted({self._to_text(r.get("option")).upper() for r in rows if self._to_text(r.get("option"))})
+            self._combo_fill(self.contract_strike_combo, strikes)
+            self._combo_fill(self.contract_option_combo, options)
+        else:
+            self._combo_fill(self.contract_strike_combo, [])
+            self._combo_fill(self.contract_option_combo, [])
 
     def _on_contract_expiry_changed(self, value):
         exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
@@ -2141,7 +2810,18 @@ class TradingWindow(QMainWindow):
         if expiry:
             strikes = self.contract_cache.get("fo_exsyminstexp_to_strike", {}).get((exchange, symbol, inst, expiry), [])
         self._combo_fill(self.contract_strike_combo, strikes)
-        self._combo_fill(self.contract_option_combo, [])
+        if not strikes and expiry:
+            rows = self.contract_cache.get("fo_rows_by_exsyminst", {}).get((exchange, symbol, inst), [])
+            options = sorted(
+                {
+                    self._to_text(r.get("option")).upper()
+                    for r in rows
+                    if self._to_text(r.get("expiry")) == expiry and self._to_text(r.get("option"))
+                }
+            )
+            self._combo_fill(self.contract_option_combo, options)
+        else:
+            self._combo_fill(self.contract_option_combo, [])
 
     def _on_contract_strike_changed(self, value):
         exchange = self._to_text(self.contract_exchange_combo.currentText()).upper()
@@ -2170,13 +2850,33 @@ class TradingWindow(QMainWindow):
             expiry = self._to_text(self.contract_expiry_combo.currentText())
             strike = self._to_text(self.contract_strike_combo.currentText())
             option = self._to_text(self.contract_option_combo.currentText()).upper()
-            if not (inst and expiry and strike and option):
+            if not inst:
                 self.bus.error.emit(
                     "Incomplete Filter",
-                    "For FO, select Series/InstType, Expiry, Strike and Option Type before Enter.",
+                    "For FO, select Series/InstType before Enter.",
                 )
                 return
-            row = self.contract_cache.get("fo_row_by_fullkey", {}).get((exchange, symbol, inst, expiry, strike, option))
+            rows = self.contract_cache.get("fo_rows_by_exsyminst", {}).get((exchange, symbol, inst), [])
+            if not rows:
+                self.bus.error.emit("Not Found", "No contract matched selected filters.")
+                return
+            if self._inst_needs_expiry(inst):
+                if not expiry:
+                    self.bus.error.emit("Incomplete Filter", "Select Expiry Date for Futures/Options.")
+                    return
+                filtered = [r for r in rows if self._to_text(r.get("expiry")) == expiry]
+                if strike:
+                    filtered = [r for r in filtered if self._to_text(r.get("strike")) == strike]
+                if option:
+                    filtered = [r for r in filtered if self._to_text(r.get("option")).upper() == option]
+                row = filtered[0] if filtered else None
+            else:
+                filtered = rows
+                if strike:
+                    filtered = [r for r in filtered if self._to_text(r.get("strike")) == strike]
+                if option:
+                    filtered = [r for r in filtered if self._to_text(r.get("option")).upper() == option]
+                row = filtered[0] if filtered else rows[0]
         else:
             row = self.contract_cache.get("eq_row_by_exsym", {}).get((exchange, symbol))
         if not row:
@@ -2387,6 +3087,8 @@ class TradingWindow(QMainWindow):
         }
 
     def focus_token_from_toolbar(self):
+        if not hasattr(self, "focus_token_input"):
+            return
         token = self.focus_token_input.text().strip()
         if not token:
             return
@@ -2419,7 +3121,8 @@ class TradingWindow(QMainWindow):
     def _activate_token(self, token, open_chart=False):
         token = str(token)
         self.active_token = token
-        self.focus_token_input.setText(token)
+        if hasattr(self, "focus_token_input"):
+            self.focus_token_input.setText(token)
         row = self.model.row_by_token(token)
         self._set_quote_strip(row)
         if open_chart:
@@ -2612,6 +3315,11 @@ class TradingWindow(QMainWindow):
                 self._build_contract_lookup(df)
                 self.bus.contract_ready.emit()
                 self.bus.log.emit(f"Contract data loaded: {len(self.token_metadata)} tokens.")
+                auto_index_tokens = sorted(set(self.didx_tokens))
+                if auto_index_tokens:
+                    self._start_stream_for_tokens(auto_index_tokens, source_label="IndexViewAuto", track_watchlist=False)
+                else:
+                    self._start_stream_for_tokens([self.primary_index_token], source_label="IndexViewAuto", track_watchlist=False)
             except Exception as exc:
                 self.bus.log.emit(f"Contract data load failed: {exc}")
 
@@ -2635,6 +3343,8 @@ class TradingWindow(QMainWindow):
             self.contract_lookup.clear()
             self.token_metadata.clear()
             self.index_tokens.clear()
+            self.didx_tokens.clear()
+            self.stream_subscribed_tokens.clear()
             self.bus.session_info.emit("Not logged in")
             self.bus.login_state.emit(False)
             self.bus.status.emit("Disconnected")
@@ -2656,17 +3366,19 @@ class TradingWindow(QMainWindow):
 
         self._start_stream_for_tokens(tokens, source_label="Manual")
 
-    def _start_stream_for_tokens(self, tokens, source_label="Manual"):
+    def _start_stream_for_tokens(self, tokens, source_label="Manual", track_watchlist=True):
         base_tokens = [str(t) for t in tokens if str(t).strip()]
         if self.streaming_active and self.stream_thread and self.stream_thread.is_alive() and self.api:
-            incremental = [tok for tok in dict.fromkeys(base_tokens) if tok not in self.current_tokens]
-            if self.primary_index_token not in self.current_tokens:
+            incremental = [tok for tok in dict.fromkeys(base_tokens) if tok not in self.stream_subscribed_tokens]
+            if self.primary_index_token not in self.stream_subscribed_tokens:
                 incremental.append(self.primary_index_token)
             incremental = list(dict.fromkeys(incremental))
             if incremental:
                 def task_sub():
                     self.api.subscribe_token(incremental)
-                    self.current_tokens.update([tok for tok in incremental if tok != self.primary_index_token])
+                    self.stream_subscribed_tokens.update(incremental)
+                    if track_watchlist:
+                        self.current_tokens.update([tok for tok in incremental if tok != self.primary_index_token])
                     self.index_tokens.add(self.primary_index_token)
                     self.bus.log.emit(f"Stream already active. Added {len(incremental)} token(s).")
                 self._run_bg(task_sub, f"Subscribe Stream {source_label}")
@@ -2680,7 +3392,9 @@ class TradingWindow(QMainWindow):
         if self.primary_index_token not in stream_tokens:
             stream_tokens.append(self.primary_index_token)
             self.bus.log.emit(f"Index token added for WS time: {self.primary_index_token}")
-        self.current_tokens = set(base_tokens)
+        self.stream_subscribed_tokens = set(stream_tokens)
+        if track_watchlist:
+            self.current_tokens.update(base_tokens)
 
         def task():
             self.api.start_apollo(
@@ -2780,6 +3494,7 @@ class TradingWindow(QMainWindow):
                 if token not in self.current_tokens and token not in self.index_tokens:
                     continue
                 if token in self.index_tokens:
+                    self.index_latest[token] = normalized
                     self._update_ws_server_time(normalized.get("ltt"), normalized.get("lut"))
                 if token in self.current_tokens:
                     latest[token] = normalized
@@ -2794,6 +3509,8 @@ class TradingWindow(QMainWindow):
             return
 
         self.model.upsert_many(latest)
+        if self.index_popup and self.index_popup.isVisible():
+            self._refresh_index_popup_table()
 
         if self.active_token:
             row = self.model.row_by_token(self.active_token)
@@ -2859,7 +3576,9 @@ class TradingWindow(QMainWindow):
 
         def task():
             stats = self.api.get_performance_stats()
-            self.bus.log.emit(f"Performance stats: {json.dumps(stats, default=str)}")
+            text = json.dumps(stats, default=str, indent=2)
+            self.bus.log.emit(f"Performance stats: {text}")
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Performance Stats", text))
 
         self._run_bg(task, "Performance Stats")
 
