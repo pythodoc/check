@@ -1205,6 +1205,7 @@ class TradingWindow(QMainWindow):
         self.contract_colmap = {}
         self.contract_lookup = {}
         self.contract_cache = {}
+        self.contract_row_by_token = {}
         self.token_metadata = {}
         self.primary_index_token = "101999957"
         self.index_tokens = {self.primary_index_token}
@@ -1259,6 +1260,12 @@ class TradingWindow(QMainWindow):
         self.strategy_expiry_combo = None
         self.strategy_view_combo = None
         self.strategy_risk_input = None
+        self.strategy_rows_cache = []
+        self.ai_popup = None
+        self.ai_model = None
+        self.ai_table = None
+        self.ai_summary = None
+        self.ai_timer = None
 
         self._build_ui()
         self._set_logged_in_state(False)
@@ -1423,6 +1430,9 @@ class TradingWindow(QMainWindow):
         self.btn_strategy = QPushButton("Strategy Finder")
         self.btn_strategy.clicked.connect(self.show_strategy_finder)
         row.addWidget(self.btn_strategy)
+        self.btn_ai = QPushButton("AI Advisor")
+        self.btn_ai.clicked.connect(self.show_ai_advisor)
+        row.addWidget(self.btn_ai)
 
         self.perf_badge = QLabel("ticks/s: -  backlog: -")
         self.perf_badge.setStyleSheet("color: #93c5fd; font-weight: 600;")
@@ -2213,8 +2223,181 @@ class TradingWindow(QMainWindow):
     def _set_strategy_rows(self, rows):
         if not self.strategy_model:
             return
+        self.strategy_rows_cache = list(rows or [])
         columns = ["strategy", "legs", "expiry", "atm", "cost", "max_profit", "max_loss", "breakeven", "liquidity", "score"]
         self.strategy_model.set_records(columns, rows or [])
+        if self.ai_popup and self.ai_popup.isVisible():
+            self._refresh_ai_advisor()
+
+    def _ensure_ai_popup(self):
+        if self.ai_popup is not None:
+            return self.ai_popup
+
+        self.ai_popup = QDialog(self)
+        self.ai_popup.setModal(False)
+        self.ai_popup.resize(1120, 700)
+        self.ai_popup.setWindowTitle("AI Advisor")
+        self.ai_popup.finished.connect(lambda _: self.ai_timer.stop() if self.ai_timer else None)
+
+        layout = QVBoxLayout(self.ai_popup)
+        self.ai_summary = QLabel("AI advisor will analyze live market ticks and strategy data.")
+        self.ai_summary.setWordWrap(True)
+        self.ai_summary.setStyleSheet("color: #cbd5e1; padding: 4px 2px;")
+        layout.addWidget(self.ai_summary)
+
+        self.ai_table = QTableView()
+        self.ai_model = AccountTableModel()
+        self.ai_table.setModel(self.ai_model)
+        self.ai_table.setAlternatingRowColors(True)
+        self.ai_table.verticalHeader().setVisible(False)
+        self.ai_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.ai_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.ai_table, 1)
+
+        note = QLabel("Advisory only. This is model-driven assistance, not guaranteed financial advice.")
+        note.setStyleSheet("color: #93c5fd;")
+        layout.addWidget(note)
+
+        if self.ai_timer is None:
+            self.ai_timer = QTimer(self)
+            self.ai_timer.setInterval(2500)
+            self.ai_timer.timeout.connect(self._refresh_ai_advisor)
+        return self.ai_popup
+
+    def show_ai_advisor(self):
+        popup = self._ensure_ai_popup()
+        self._refresh_ai_advisor()
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+        if self.ai_timer and not self.ai_timer.isActive():
+            self.ai_timer.start()
+
+    def _market_regime(self):
+        target_tokens = set(self.didx_tokens) if self.didx_tokens else set(self.index_tokens)
+        values = []
+        for token, row in self.index_latest.items():
+            if token not in target_tokens:
+                continue
+            pch = _to_float(row.get("p_change"))
+            if pch is not None:
+                values.append(pch)
+        if not values:
+            return {"mode": "neutral", "avg_p_change": 0.0, "vol": 0.0}
+        avg = sum(values) / max(1, len(values))
+        vol = max(values) - min(values) if len(values) > 1 else abs(avg)
+        if avg > 0.5:
+            mode = "bullish"
+        elif avg < -0.5:
+            mode = "bearish"
+        else:
+            mode = "neutral"
+        if vol >= 1.8:
+            mode = "volatile"
+        return {"mode": mode, "avg_p_change": avg, "vol": vol}
+
+    def _classify_segment(self, token, row):
+        meta = self.contract_row_by_token.get(str(token), {})
+        inst = str(meta.get("inst") or row.get("asset_type") or "").upper()
+        exchange_seg = str(meta.get("exchange") or "").upper()
+        if "OPT" in inst:
+            return "OPTIONS"
+        if "FUT" in inst:
+            return "FUTURES"
+        if exchange_seg.endswith("FO") and inst and inst != "DIDX":
+            return "FUTURES"
+        return "EQUITY"
+
+    def _ai_equity_idea(self, row, regime):
+        pch = _to_float(row.get("p_change"))
+        change = _to_float(row.get("change"))
+        vol = _to_float(row.get("tot_vol")) or 0.0
+        if pch is None:
+            return ("WATCH", 48, "Insufficient momentum data.", "Medium")
+        score = 50.0 + (pch * 8.0) + (2.0 if change and change > 0 else -2.0) + min(10.0, vol / 200000.0)
+        if regime["mode"] == "bearish":
+            score -= 7.0
+        if regime["mode"] == "volatile":
+            score -= 10.0
+        if score >= 62:
+            return ("DO", min(95, int(score)), f"Trend positive ({pch:+.2f}%) with supportive volume.", "Use stop loss")
+        if score <= 44:
+            return ("DO NOT", max(5, int(score)), f"Weak/negative momentum ({pch:+.2f}%).", "Avoid fresh entry")
+        return ("WATCH", int(score), f"Mixed signal ({pch:+.2f}%), wait for confirmation.", "Medium")
+
+    def _ai_futures_idea(self, row, regime):
+        pch = _to_float(row.get("p_change"))
+        oi = _to_float(row.get("oi")) or 0.0
+        if pch is None:
+            return ("WATCH", 50, "No reliable momentum from live feed.", "High leverage risk")
+        score = 50.0 + (pch * 7.5) + min(8.0, oi / 500000.0)
+        if regime["mode"] == "bullish":
+            score += 3.0 if pch > 0 else -4.0
+        elif regime["mode"] == "bearish":
+            score += 3.0 if pch < 0 else -4.0
+        elif regime["mode"] == "volatile":
+            score -= 8.0
+        if score >= 64:
+            side = "long" if pch > 0 else "short"
+            return ("DO", min(95, int(score)), f"{side.title()} bias from momentum/OI ({pch:+.2f}%).", "Tight SL mandatory")
+        if score <= 44:
+            return ("DO NOT", max(5, int(score)), f"Poor setup for leveraged futures ({pch:+.2f}%).", "High risk")
+        return ("WATCH", int(score), "Futures setup not clean yet.", "High leverage risk")
+
+    def _ai_options_ideas(self, regime):
+        out = []
+        top = sorted(self.strategy_rows_cache or [], key=lambda r: _to_float(r.get("score")) or 0.0, reverse=True)[:4]
+        for row in top:
+            score = _to_float(row.get("score")) or 0.0
+            action = "DO" if score >= 62 else ("DO NOT" if score <= 45 else "WATCH")
+            if regime["mode"] == "volatile" and "Short" in str(row.get("strategy", "")):
+                action = "DO NOT"
+                score = min(score, 42.0)
+            out.append(
+                {
+                    "segment": "OPTIONS",
+                    "symbol": row.get("strategy", "-"),
+                    "action": action,
+                    "confidence": f"{int(max(5, min(95, score)))}",
+                    "reason": f"{row.get('legs', '')} | Score {row.get('score', '-')}",
+                    "risk": "Defined-risk preferred" if "Spread" in str(row.get("strategy", "")) else "Premium decay risk",
+                }
+            )
+        return out
+
+    def _refresh_ai_advisor(self):
+        if not self.ai_model:
+            return
+        regime = self._market_regime()
+        rows = []
+        for row in getattr(self.model, "_rows", []):
+            token = str(row.get("symbol") or "")
+            segment = self._classify_segment(token, row)
+            if segment == "OPTIONS":
+                continue
+            if segment == "EQUITY":
+                action, conf, reason, risk = self._ai_equity_idea(row, regime)
+            else:
+                action, conf, reason, risk = self._ai_futures_idea(row, regime)
+            rows.append(
+                {
+                    "segment": segment,
+                    "symbol": row.get("name") or token,
+                    "action": action,
+                    "confidence": str(conf),
+                    "reason": reason,
+                    "risk": risk,
+                }
+            )
+        rows.sort(key=lambda x: int(x.get("confidence") or "0"), reverse=True)
+        rows = rows[:8] + self._ai_options_ideas(regime)
+        rows = rows[:12]
+        columns = ["segment", "symbol", "action", "confidence", "reason", "risk"]
+        self.ai_model.set_records(columns, rows)
+        if self.ai_summary:
+            self.ai_summary.setText(
+                f"Regime: {regime['mode'].upper()} | Index avg %: {regime['avg_p_change']:+.2f} | Vol spread: {regime['vol']:.2f} | Updated: {datetime.now().strftime('%H:%M:%S')}"
+            )
 
     @staticmethod
     def _pick_from_row(row, candidates):
@@ -2530,6 +2713,7 @@ class TradingWindow(QMainWindow):
             ("F8", self.fetch_margin),
             ("F10", self.open_chart_popup_and_start_broadcast),
             ("Ctrl+P", self.show_perf_stats),
+            ("Ctrl+I", self.show_ai_advisor),
         )
         for key, handler in mappings:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -2550,6 +2734,7 @@ class TradingWindow(QMainWindow):
         self.contract_colmap = {}
         self.contract_lookup.clear()
         self.contract_cache = {}
+        self.contract_row_by_token.clear()
         self.token_metadata.clear()
         self.index_tokens.clear()
         self.index_tokens.add(self.primary_index_token)
@@ -2645,6 +2830,7 @@ class TradingWindow(QMainWindow):
                 "option": option,
                 "asset_type": asset_type,
             }
+            self.contract_row_by_token[token] = row_data
             exsym = (exchange, symbol)
             if self._is_fo_segment(exchange):
                 if inst:
@@ -3341,6 +3527,7 @@ class TradingWindow(QMainWindow):
             self.contract_df = None
             self.contract_cache = {}
             self.contract_lookup.clear()
+            self.contract_row_by_token.clear()
             self.token_metadata.clear()
             self.index_tokens.clear()
             self.didx_tokens.clear()
