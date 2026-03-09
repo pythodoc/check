@@ -917,6 +917,42 @@ class GreekAPI:
         url = self.get_url("getQuoteForSingleSymbol_V2")
         result = self._make_request(url, params)
         return result.get('response', {}).get('data')
+    
+    def multiple_token_broadcast(self,asset_type,exchange,token_list):
+        exchange_tokens = [
+            {
+                "asset_type": str(asset_type),
+                "exchange":str(exchange),
+                "token": str(token)
+            }
+            for token in token_list
+        ]
+        params={
+            "request": {
+                "data": {
+                    "symbolList": exchange_tokens
+                },
+                "svcName": "getQuoteForMultipleSymbols",
+                "svcGroup": "Markets"
+            }
+        }
+        svcname='getQuoteForMultipleSymbols'
+        url_mtb = self.get_url(svcname)
+        if self.is_base64:
+            params = self.json_to_base64(params)
+            stoken = self.session_token
+            headers = { "Authorization":""+str(stoken) ,"charset": "utf-8", "Content-Type": "application/json" }
+            y1 =  req.post(url_mtb,data=params,headers=headers ,verify=self.ssl_verify )
+            y1 = y1.text
+            z1 = self.base64_to_json(y1)
+            response = z1.get('response',{}).get('data',{}).get('quotelist')
+        else:
+            stoken = self.session_token
+            headers = { "Authorization":""+str(stoken) ,"charset": "utf-8", "Content-Type": "application/json" }
+            y1 =  req.post(url_mtb,json=params,headers=headers ,verify=self.ssl_verify )
+            z1 = y1.json()
+            response = z1.get('response',{}).get('data',{}).get('quotelist')
+        return response
 
     def MBP_data(self, exchange, token_list):
         """Get Market By Price data for multiple tokens"""

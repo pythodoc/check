@@ -1720,10 +1720,12 @@ class TradingWindow(QMainWindow):
         filters.addWidget(QLabel("Symbol"))
         self.strategy_symbol_combo = QComboBox()
         self.strategy_symbol_combo.setEditable(True)
+        self.strategy_symbol_combo.setFixedWidth(180)
         self.strategy_symbol_combo.currentTextChanged.connect(self._on_strategy_symbol_changed)
-        filters.addWidget(self.strategy_symbol_combo, 1)
+        filters.addWidget(self.strategy_symbol_combo)
         filters.addWidget(QLabel("Expiry"))
         self.strategy_expiry_combo = QComboBox()
+        self.strategy_expiry_combo.setFixedWidth(180)
         filters.addWidget(self.strategy_expiry_combo)
         filters.addWidget(QLabel("View"))
         self.strategy_view_combo = QComboBox()
@@ -2307,6 +2309,36 @@ class TradingWindow(QMainWindow):
         if exchange_seg.endswith("FO") and inst and inst != "DIDX":
             return "FUTURES"
         return "EQUITY"
+
+    @staticmethod
+    def _normalize_asset_type_for_broadcast(value):
+        text = str(value or "").strip().upper()
+        if not text:
+            return ""
+        if "OPT" in text or text in ("OPTION", "OPTIONS", "CE", "PE"):
+            return "Option"
+        if "FUT" in text or text in ("F", "FUTURE", "FUTURES"):
+            return "Future"
+        if "EQ" in text or text in ("E", "EQUITY", "CASH"):
+            return "Equity"
+        if "IDX" in text or "INDEX" in text:
+            return "Index"
+        return str(value).strip()
+
+    def _broadcast_asset_type(self, token="", row=None, fallback=""):
+        token_key = str(token or "").strip()
+        meta = self.contract_row_by_token.get(token_key, {}) if token_key else {}
+        candidates = []
+        if isinstance(meta, dict):
+            candidates.extend([meta.get("inst"), meta.get("asset_type")])
+        if isinstance(row, dict):
+            candidates.extend([row.get("inst"), row.get("asset_type")])
+        candidates.append(fallback)
+        for value in candidates:
+            normalized = self._normalize_asset_type_for_broadcast(value)
+            if normalized:
+                return normalized
+        return ""
 
     def _ai_equity_idea(self, row, regime):
         pch = _to_float(row.get("p_change"))
